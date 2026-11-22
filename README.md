@@ -55,7 +55,9 @@ rm -rf ~/Deckhand
 ## Notes
 
 - Walls on the house map come from your controller: hold it out against a wall as you walk along it.
-  The Frame's cameras don't share wall or depth data with apps.
+  Hold the trigger (or grip) while the controller touches the wall; the Frame's cameras
+  don't share wall or depth data with apps. Dashed lines are walls estimated from where you walked.
+- Signal maps use a colour-blind-safe gradient (dark purple = weak → yellow = strong) with a dBm scale.
 - The dongle's strength is how loudly the Frame hears the PC's dongle (its 6 GHz link); it only shows
   while the PC and Steam are on.
 - Not made by or affiliated with Valve. Use at your own risk.
