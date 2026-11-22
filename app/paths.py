@@ -16,5 +16,5 @@ ICON = os.path.join(ASSETS, "steam", "icon.png")
 
 
 def tool(name):
-    """Full path of a built native helper (timer_overlay, space_tool, chaperone_tool, ceiling_overlay)."""
+    """Full path of a built native helper (timer_overlay, space_tool, ceiling_overlay)."""
     return os.path.join(BIN, name)

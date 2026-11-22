@@ -22,11 +22,9 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
-import paths  # noqa: E402  (where the native helpers are)
 
 CFG = os.path.expanduser("~/.config/openvr/config")
 VRCHAP = os.path.join(CFG, "chaperone_info.vrchap")
@@ -221,32 +219,21 @@ def delete(room_id):
     log(f"deleted {room_id}")
 
 
-LAST_LOAD = os.path.join(ROOMS, ".last_load")
-LOAD_COOLDOWN = 60  # SteamVR stops auto-restarting tracking after several restarts within a minute
 
 
-def start_load(room_id, quick=False):
-    """Runs the load as its own background job (a full load stops SteamVR, which closes the app).
+def start_load(room_id):
+    """Runs the load as its own background job (it stops SteamVR, which closes the app).
 
-    Default is the full load (restart SteamVR, ~12 s): the user preferred it to the quick
-    load (tracking-only restart, ~19 s of frozen/black view, apps stay open), which is kept
-    for reference but not used by the app."""
+    Always the full, graceful load: SteamVR is asked to stop, the room's files are swapped in,
+    SteamVR starts again (~12 s). An earlier "quick" load that froze and killed the tracking
+    service was removed: killing it while the cameras stream can leave the camera hardware in a
+    bad state until the next reboot."""
     if not os.path.isfile(os.path.join(room_dir(room_id), "meta.json")):
         return False, "that room isn't saved"
-    if quick:
-        try:
-            wait = LOAD_COOLDOWN - (time.time() - os.path.getmtime(LAST_LOAD))
-        except OSError:
-            wait = 0
-        if wait > 0:
-            return False, f"give tracking a minute between loads (about {int(wait) + 1} s more)"
-        os.makedirs(ROOMS, exist_ok=True)
-        with open(LAST_LOAD, "w") as f:
-            f.write(room_id)
     subprocess.run(["systemctl", "--user", "reset-failed", "frame-room-load"], capture_output=True)
     r = subprocess.run(["systemd-run", "--user", "--quiet", "--collect", "--unit=frame-room-load",
                         "--description=Deckhand: load a saved room",
-                        sys.executable, os.path.abspath(__file__), "--quick" if quick else "--apply", room_id],
+                        sys.executable, os.path.abspath(__file__), "--apply", room_id],
                        capture_output=True, text=True)
     return r.returncode == 0, (r.stdout + r.stderr).strip() or "loading"
 
@@ -287,82 +274,6 @@ def _merge_universes(src_vrchap):
             json.dump(live, f, indent=3)
         os.replace(tmp, VRCHAP)
     return len(add)
-
-
-def quick_apply(room_id):
-    """Loads a room by restarting only the tracking service (XRService), not SteamVR.
-
-    The boundary travels inside the room map: on recognising a map, XRService hands
-    SteamVR the boundary's id and outline, and SteamVR re-creates it if needed. So:
-    freeze XRService (it can't write its map mid-swap), back up + swap the map, add
-    the saved boundaries to SteamVR's list, then kill it. SteamVR's watchdog restarts
-    a tracking service that didn't exit cleanly, and it relocalises into the swapped
-    map. Apps keep running; tracking pauses for a few seconds. Falls back to a full
-    SteamVR restart if tracking doesn't come back.
-    """
-    src = room_dir(room_id)
-    tool = paths.tool("chaperone_tool")
-    pid = _pid("XRService")
-    if not pid or not _pid("vrserver"):
-        log(f"quick load {room_id}: SteamVR/tracking not running; doing a full load")
-        return apply(room_id)
-    universe_before = active_universe_id()
-    t0 = time.time()
-    log(f"quick load {room_id}: freezing tracking service {pid}")
-    os.kill(pid, signal.SIGSTOP)
-    swapped = False
-    try:
-        if room_id != BACKUP:
-            _copy_room(room_dir(BACKUP))  # what was in use, for "Undo last load"
-            _write_meta(BACKUP, {"name": "Before last load", "saved": time.time(),
-                                 **describe(VRCHAP, MAP_DIR, universe_before)})
-        for m in os.listdir(MAP_DIR):  # map files (and any half-written temp file)
-            os.remove(os.path.join(MAP_DIR, m))
-        for m in os.listdir(os.path.join(src, "serializedmap")):
-            shutil.copy2(os.path.join(src, "serializedmap", m), os.path.join(MAP_DIR, m))
-        added = _merge_universes(os.path.join(src, "chaperone_info.vrchap"))
-        # SteamVR keeps boundaries in memory and writes them back over the file: make it reload
-        # the merged file now, so the room's boundary is there when tracking recognises the room.
-        r = subprocess.run([tool, "reload"], capture_output=True, text=True, timeout=15)
-        swapped = True
-        log(f"quick load {room_id}: map swapped, {added} boundaries added, "
-            f"SteamVR reload: {(r.stdout + r.stderr).strip() or r.returncode}")
-    except Exception as e:  # noqa: BLE001
-        log(f"quick load {room_id}: swap failed: {e}")
-    finally:
-        os.kill(pid, signal.SIGKILL)  # no clean exit = no map save over ours; the watchdog restarts it
-    new_pid = None
-    for _ in range(60):
-        time.sleep(0.5)
-        p = _pid("XRService")
-        if p and p != pid:
-            new_pid = p
-            break
-    if not new_pid:
-        log(f"quick load {room_id}: tracking service didn't come back in 30 s; restarting SteamVR")
-        subprocess.run(["systemctl", "--user", "restart", "steamvr.service"], capture_output=True)
-        return 1
-    log(f"quick load {room_id}: tracking service back as {new_pid} after {time.time() - t0:.1f} s"
-        + ("" if swapped else " (swap failed: old map in use)"))
-    target = _saved_active_universe(src)
-    if not swapped or not target:
-        return 0
-    # Wait for the room to be recognised: SteamVR then has that boundary (often re-created
-    # as a plain square, because its in-memory list dropped the saved shape).
-    for _ in range(60):
-        time.sleep(0.5)
-        u = active_universe_id()
-        if u and target.startswith(u):
-            break
-    else:
-        log(f"quick load {room_id}: room not recognised within 30 s (look around the room; "
-            "the boundary comes back once it is)")
-        return 0
-    time.sleep(1.5)  # let SteamVR finish writing its own copy first
-    fixed = _restore_shape(src, target, tool)
-    log(f"quick load {room_id}: recognised (boundary {target}), shape "
-        f"{'restored' if fixed else 'already right'}; {time.time() - t0:.1f} s total")
-    return 0
 
 
 def _saved_active_universe(src):
@@ -442,8 +353,6 @@ def apply(room_id):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--apply"] and len(sys.argv) == 3:
         sys.exit(apply(sys.argv[2]))
-    elif sys.argv[1:2] == ["--quick"] and len(sys.argv) == 3:
-        sys.exit(quick_apply(sys.argv[2]))
     elif sys.argv[1:] == ["--list"]:
         print(json.dumps({"current": current(), "saved": list_rooms()}, indent=2)[:4000])
     else:
