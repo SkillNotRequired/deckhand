@@ -33,9 +33,9 @@ python3 "$DEST/app/updater.py" cleanup   # tidy an older install's flat layout
 
 say "Building helpers (a few seconds)…"
 bash "$DEST/helpers/build.sh"
-python3 "$DEST/app/updater.py" migrate >/dev/null 2>&1 || true   # services follow the app
+[ -n "${DECKHAND_TEST:-}" ] || python3 "$DEST/app/updater.py" migrate >/dev/null 2>&1 || true   # services follow the app
 
-if [ -z "${DECKHAND_SKIP_SHORTCUT:-}" ]; then  # (set it to test an install without touching Steam)
+if [ -z "${DECKHAND_TEST:-}" ]; then  # DECKHAND_TEST=1: test install, leaves Steam and services alone
   say "Adding it to Steam and the app menu…"
   if ! python3 "$DEST/app/steam_shortcut.py"; then
     echo "(The app menu entry is in. For the Steam library, add $DEST/launch.sh as a Non-Steam Game.)"

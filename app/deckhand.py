@@ -756,7 +756,8 @@ class FrameSettings(Gtk.Window):
         self.refresh_power()
         self.refresh_live()
         self.show_page("Fan")
-        in_background(updater.migrate_units, lambda _r: None)
+        if "--snapshot" not in sys.argv:  # background services follow this copy of the app
+            in_background(updater.migrate_units, lambda _r: None)
         # Light on battery: live numbers every 3 s, the timer clock every 1 s only while its page
         # shows, and nothing at all while the window isn't focused (refreshed again on return).
         self.connect("focus-out-event", self.on_focus_change, False)
