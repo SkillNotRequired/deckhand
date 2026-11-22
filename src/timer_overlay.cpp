@@ -173,7 +173,13 @@ struct Overlay {
     }
 
     void close() {
-        if (ov && h != vr::k_ulOverlayHandleInvalid) ov->DestroyOverlay(h);
+        // Hide first and give the compositor time to finish with the last raw upload: destroying
+        // the overlay and disconnecting right after SetOverlayRaw crashed vrcompositor (SIGBUS).
+        if (ov && h != vr::k_ulOverlayHandleInvalid) {
+            ov->HideOverlay(h);
+            usleep(1000000);
+            ov->DestroyOverlay(h);
+        }
         if (ov) vr::VR_Shutdown();
         ov = nullptr;
         h = vr::k_ulOverlayHandleInvalid;
@@ -210,7 +216,9 @@ static int selftest(const char *path) {
             rc = oe == vr::VROverlayError_None ? 0 : 1;
         }
         printf("selftest: visible %d\n", int(ov->IsOverlayVisible(h)));
+        usleep(1500000);  // let the compositor finish with the uploads (see Overlay::close)
         ov->DestroyOverlay(h);
+        usleep(500000);
     }
     vr::VR_Shutdown();
     return rc;

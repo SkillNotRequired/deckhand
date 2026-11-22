@@ -335,6 +335,10 @@ int main() {
             }
             usleep(100000);
         }
+        ov->HideOverlay(grid);  // hide, then let the compositor let go before destroying (see timer_overlay)
+        ov->HideOverlay(up);
+        ov->HideOverlay(down);
+        usleep(500000);
         ov->DestroyOverlay(grid);
         ov->DestroyOverlay(up);
         ov->DestroyOverlay(down);
