@@ -418,10 +418,25 @@ def card(title=None, desc=None):
     return box
 
 
+# Icons the desktop theme may not have, drawn here (light lines for the dark buttons)
+ICON_SVG = {
+    "deckhand-move": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#eef4fa" '
+                     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20"/>'
+                     '<path d="M9 5l3-3 3 3M9 19l3 3 3-3M5 9l-3 3 3 3M19 9l3 3-3 3"/></svg>',
+}
+
+
 def icon_image(names, size=48):
     if isinstance(names, str) and names.endswith(".png") and os.path.isfile(names):
         pix = GdkPixbuf.Pixbuf.new_from_file_at_size(names, size, size)
         return Gtk.Image.new_from_pixbuf(pix)
+    for n in ([names] if isinstance(names, str) else names):
+        if n in ICON_SVG:
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.set_size(size, size)
+            loader.write(ICON_SVG[n].encode())
+            loader.close()
+            return Gtk.Image.new_from_pixbuf(loader.get_pixbuf())
     theme = Gtk.IconTheme.get_default()
     for n in ([names] if isinstance(names, str) else names):
         if theme.has_icon(n):
@@ -1817,7 +1832,10 @@ class FrameSettings(Gtk.Window):
         return loader.get_pixbuf()
 
     # ==================================================== whole-house map
-    MAP_W, MAP_H = 820, 660  # house map picture, pixels
+    MAP_W, MAP_H = 820, 640  # house map picture, pixels
+    TOOL_HINTS = {"move": "Move: drag the map", "zoom": "Zoom: tap to zoom in there, right-click to zoom out",
+                  "labels": "Labels: tap to {mode}", "signal": "Signal: tap a spot to see its strength"}
+    TOOL_CURSORS = {"move": "grab", "zoom": "zoom-in", "labels": "cell", "signal": "crosshair"}
 
     def build_house_page(self):
         self.house_rec = None
@@ -1841,7 +1859,25 @@ class FrameSettings(Gtk.Window):
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.house_floor_box = Gtk.Box()
         left.pack_start(self.house_floor_box, False, False, 0)
+        tools = Gtk.Box(spacing=8, homogeneous=True)  # what dragging / tapping the map does
+        self.map_tool = "move"
+        self.map_tool_btns = {}
+        for tool, icons, text in (("move", ["deckhand-move"], "Move"),
+                                  ("zoom", ["zoom-in"], "Zoom"),
+                                  ("labels", ["tag", "bookmark-new"], "Labels"),
+                                  ("signal", ["network-wireless-signal-excellent-symbolic", "network-wireless"],
+                                   "Signal")):
+            b = Gtk.Button()
+            inner = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER)
+            inner.pack_start(icon_image(icons, 34), False, False, 0)
+            inner.pack_start(label(text), False, False, 0)
+            b.add(inner)
+            b.connect("clicked", lambda _b, t=tool: self.set_map_tool(t))
+            tools.pack_start(b, True, True, 0)
+            self.map_tool_btns[tool] = b
+        left.pack_start(tools, False, False, 0)
         ev = Gtk.EventBox()
+        self.house_ev = ev
         ev.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
                       Gdk.EventMask.BUTTON1_MOTION_MASK | Gdk.EventMask.SCROLL_MASK)
         self.house_img = Gtk.Image()
@@ -1850,17 +1886,26 @@ class FrameSettings(Gtk.Window):
         ev.connect("motion-notify-event", self.on_map_drag)
         ev.connect("button-release-event", self.on_map_release)
         ev.connect("scroll-event", self.on_map_scroll)
+        ev.connect("realize", lambda *_: self.set_map_cursor())
         left.pack_start(ev, False, False, 0)
-        for row_items in ((("⟲ Rotate", lambda: self.map_view(angle=-15)), ("Rotate ⟳", lambda: self.map_view(angle=15)),
-                           ("Reset view", self.map_reset)),
-                          (("− Zoom out", lambda: self.map_view(zoom=1 / 1.25)), ("Zoom in +", lambda: self.map_view(zoom=1.25)),
-                           ("Center on me", self.map_center_me))):
-            view = Gtk.Box(spacing=8, homogeneous=True)  # map view controls (drag the map to move it)
-            for text, act in row_items:
-                b = Gtk.Button(label=text)
-                b.connect("clicked", lambda _b, a=act: a())
-                view.pack_start(b, True, True, 0)
-            left.pack_start(view, False, False, 0)
+        view = Gtk.Box(spacing=8, homogeneous=True)  # view buttons: rotate, zoom, find me, reset
+        for icons, text, act in ((["object-rotate-left"], "Left", lambda: self.map_view(angle=-15)),
+                                 (["object-rotate-right"], "Right", lambda: self.map_view(angle=15)),
+                                 (["zoom-out"], "Out", lambda: self.map_zoom_at(None, 1 / 1.4)),
+                                 (["zoom-in"], "In", lambda: self.map_zoom_at(None, 1.4)),
+                                 (["find-location", "mark-location"], "Me", self.map_center_me),
+                                 (["view-restore", "edit-reset", "zoom-original"], "Reset", self.map_reset)):
+            b = add_class(Gtk.Button(), "seg")
+            inner = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
+            inner.pack_start(icon_image(icons, 30), False, False, 0)
+            inner.pack_start(label(text), False, False, 0)
+            b.add(inner)
+            b.set_tooltip_text({"Left": "Rotate left", "Right": "Rotate right", "Out": "Zoom out", "In": "Zoom in",
+                                "Me": "Center on me", "Reset": "Reset the view"}[text])
+            b.connect("clicked", lambda _b, a=act: a())
+            view.pack_start(b, True, True, 0)
+        left.pack_start(view, False, False, 0)
+        GLib.idle_add(lambda: (self.set_map_tool("move", redraw=False), False)[1])
         row.pack_start(left, False, False, 0)
 
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -1889,7 +1934,8 @@ class FrameSettings(Gtk.Window):
         side.pack_start(self.house_progress, False, False, 0)
         self.house_result = label("", "status", wrap=True)
         side.pack_start(self.house_result, False, False, 0)
-        side.pack_start(label("Labels: choose what a tap on the map does", "card-title", wrap=True), False, False, 0)
+        side.pack_start(label("Labels (picking one switches the map to the Labels tool)", "card-title", wrap=True),
+                        False, False, 0)
         self._label_sel = None    # index of the label being moved
         self._label_undo = None   # labels before the last change
         self.label_mode = Segmented([("add", "Add"), ("move", "Move"), ("rename", "Rename"),
@@ -2016,10 +2062,15 @@ class FrameSettings(Gtk.Window):
             seg.set_value(self.house_floor)
             self.house_floor_box.pack_start(seg, True, True, 0)
             self.house_floor_box.show_all()
+        tool = getattr(self, "map_tool", "move")
+        hint = self.TOOL_HINTS[tool].format(mode={"add": "add a label", "move": "pick a label, then tap where it goes",
+                                                  "rename": "rename a label", "delete": "delete a label"}
+                                            .get(getattr(self, "label_mode", None) and self.label_mode.value, "label"))
         pix, self._house_xf = self.house_svg(m, self.house_floor, self.house_target,
                                              selected=getattr(self, "_label_sel", None),
                                              view=self.house_view, you=self.house_you(),
-                                             w=self.MAP_W, h=self.MAP_H)
+                                             w=self.MAP_W, h=self.MAP_H, hint=hint,
+                                             inspect=getattr(self, "_inspect", None))
         self.house_img.set_from_pixbuf(pix)
 
     # ---- map view: rotate / zoom / pan (drag) / center on me / reset
@@ -2037,6 +2088,7 @@ class FrameSettings(Gtk.Window):
 
     def map_reset(self):
         self.house_view.update(angle=0.0, zoom=1.0, pan=[0.0, 0.0])
+        self._inspect = None
         self.house_prefs["angle"] = 0
         house_map.save_prefs(self.house_prefs)
         self.redraw_house()
@@ -2075,19 +2127,57 @@ class FrameSettings(Gtk.Window):
         alloc = self.house_img.get_allocation()
         return (event.x - (alloc.width - pix.get_width()) / 2, event.y - (alloc.height - pix.get_height()) / 2)
 
+    def set_map_tool(self, tool, redraw=True):
+        self.map_tool = tool
+        for t, b in self.map_tool_btns.items():
+            (b.get_style_context().add_class if t == tool else b.get_style_context().remove_class)("selected")
+        if tool != "signal":
+            self._inspect = None
+        if tool != "labels":
+            self._label_sel = None
+        self.set_map_cursor()
+        if redraw:
+            self.redraw_house()
+
+    def set_map_cursor(self, name=None):
+        win = self.house_ev.get_window() if getattr(self, "house_ev", None) else None
+        if not win:
+            return
+        try:
+            cur = Gdk.Cursor.new_from_name(win.get_display(), name or self.TOOL_CURSORS.get(self.map_tool, "default"))
+        except Exception:  # noqa: BLE001  (cursor theme without that name)
+            cur = None
+        win.set_cursor(cur)
+
+    def map_zoom_at(self, point, k):
+        """Zooms by k keeping the map spot under `point` (map pixels) still; None = the middle."""
+        xf = self._house_xf
+        v = self.house_view
+        new = max(0.4, min(8.0, v["zoom"] * k))
+        k = new / v["zoom"]
+        if xf and k != 1.0:
+            sx, sy = point if point else (xf["w"] / 2, xf["hm"] / 2)
+            cx, cy = xf["w"] / 2, xf["hm"] / 2
+            v["pan"] = [sx - cx - (sx - cx - v["pan"][0]) * k, sy - cy - (sy - cy - v["pan"][1]) * k]
+        v["zoom"] = new
+        self.redraw_house()
+
     def on_map_press(self, _w, event):
-        if event.button == 1 and self._house_xf:
+        if event.button in (1, 3) and self._house_xf:
             x, y = self._map_xy(event)
-            self._drag = {"x": x, "y": y, "pan": list(self.house_view["pan"]), "moved": False}
+            self._drag = {"x": x, "y": y, "pan": list(self.house_view["pan"]), "moved": False,
+                          "button": event.button}
+            if self.map_tool in ("move", "zoom") and event.button == 1:
+                self.set_map_cursor("grabbing")
         return True
 
     def on_map_drag(self, _w, event):
         d = self._drag
-        if not d:
-            return False
+        if not d or self.map_tool not in ("move", "zoom") or d["button"] != 1:
+            return bool(d)
         x, y = self._map_xy(event)
-        if not d["moved"] and math.hypot(x - d["x"], y - d["y"]) < 14:
-            return True  # small wobble: still a tap
+        if not d["moved"] and math.hypot(x - d["x"], y - d["y"]) < (4 if self.map_tool == "move" else 18):
+            return True  # a tap, not a drag (yet)
         d["moved"] = True
         self.house_view["pan"] = [d["pan"][0] + x - d["x"], d["pan"][1] + y - d["y"]]
         if not self._drag_redraw:  # redraw at most ~12 times a second while dragging
@@ -2104,21 +2194,55 @@ class FrameSettings(Gtk.Window):
         d, self._drag = self._drag, None
         if not d:
             return False
+        self.set_map_cursor()
+        x, y = self._map_xy(event)
+        tap = not d["moved"] and math.hypot(x - d["x"], y - d["y"]) < 24  # laser pointers wobble
         if d["moved"]:
             self.redraw_house()
-        else:
+        elif not tap:
+            pass
+        elif self.map_tool == "zoom":
+            self.map_zoom_at((x, y), 1.6 if d["button"] == 1 else 1 / 1.6)
+        elif self.map_tool == "labels" and d["button"] == 1:
             self.on_house_tap(event)
+        elif self.map_tool == "signal" and d["button"] == 1:
+            self.inspect_at(x, y)
         return True
 
     def on_map_scroll(self, _w, event):
+        point = self._map_xy(event)
         if event.direction == Gdk.ScrollDirection.UP:
-            self.map_view(zoom=1.25)
+            self.map_zoom_at(point, 1.25)
         elif event.direction == Gdk.ScrollDirection.DOWN:
-            self.map_view(zoom=1 / 1.25)
+            self.map_zoom_at(point, 1 / 1.25)
         return True
 
+    def inspect_at(self, sx, sy):
+        """Signal tool: both links' strength in the 0.5 m square tapped (or the nearest measured one)."""
+        xf = self._house_xf
+        m = getattr(self, "_house_drawn", None) or self.house_m
+        if not xf or not m or not m.get("samples"):
+            return
+        x, z = self.house_view_metres(xf, sx, sy)
+        found = {}
+        for target in house_map.TARGETS:
+            cs = {(i, j): v for (f, i, j), v in house_map.cells(m["samples"], target).items() if f == self.house_floor}
+            key = (int(x // house_map.CELL), int(z // house_map.CELL))
+            if key in cs:
+                found[target] = (cs[key], 0.0)
+                continue
+            best = None
+            for (i, j), v in cs.items():
+                d = math.hypot((i + 0.5) * house_map.CELL - x, (j + 0.5) * house_map.CELL - z)
+                if d <= 1.5 and (best is None or d < best[1]):
+                    best = (v, d)
+            found[target] = best
+        self._inspect = {"x": x, "z": z, "found": found, "first": self.house_target}
+        self.redraw_house()
+
     @staticmethod
-    def house_svg(m, floor, target="wifi", w=820, h=700, selected=None, view=None, you=None):
+    def house_svg(m, floor, target="wifi", w=820, h=640, selected=None, view=None, you=None, hint="",
+                  inspect=None):
         """Top-down map of one floor: 0.5 m squares by the chosen signal, the edge of the walked area
         (dashed), the path, labels, you, a scale bar and the signal legend. `view` rotates, zooms and
         pans it. Returns (pixbuf, transform) — the transform maps pixels back to metres for taps."""
@@ -2214,6 +2338,40 @@ class FrameSettings(Gtk.Window):
                              f'<text x="{ux:.1f}" y="{uz + 66:.1f}" fill="#fde725" font-size="24" font-weight="bold" '
                              f'text-anchor="middle" font-family="sans-serif" stroke="#0e141b" stroke-width="6" '
                              f'paint-order="stroke">You</text>')
+            if inspect:  # Signal tool: a pin and a callout with both links' numbers
+                ix, iy = P(inspect["x"], inspect["z"])
+                order = [inspect["first"]] + [t for t in house_map.TARGETS if t != inspect["first"]]
+                rows, note = [], ""
+                for t in order:
+                    hit = inspect["found"].get(t)
+                    if hit:
+                        (dbm, tx, n), dist = hit
+                        word, col = wifi_map.quality(dbm)
+                        rows.append((house_map.TARGETS[t], f"{dbm:.0f} dBm", f"{word}, {tx:.0f} Mbit/s", col))
+                        if dist > 0.01 and not note:
+                            note = f"nearest reading {dist:.1f} m away"
+                        elif not note:
+                            note = f"{n} reading{'s' if n != 1 else ''} in this 0.5 m square"
+                    else:
+                        rows.append((house_map.TARGETS[t], "—", "no reading here", "#8a96a3"))
+                bw, bh = 430, 172
+                bx = min(max(ix - bw / 2, 10), w - bw - 10)
+                by = iy - bh - 26 if iy - bh - 26 > 10 else iy + 26
+                parts.append(f'<circle cx="{ix:.1f}" cy="{iy:.1f}" r="11" fill="#ffffff" stroke="#0e141b" '
+                             f'stroke-width="4"/><circle cx="{ix:.1f}" cy="{iy:.1f}" r="4" fill="#0e141b"/>'
+                             f'<rect x="{bx:.1f}" y="{by:.1f}" width="{bw}" height="{bh}" rx="14" fill="#0e141b" '
+                             f'fill-opacity="0.92" stroke="#ffffff" stroke-width="3"/>')
+                for k, (name, num, sub, col) in enumerate(rows):
+                    ty = by + 46 + k * 58
+                    parts.append(f'<text x="{bx + 18:.1f}" y="{ty:.1f}" fill="#c9d6e3" font-size="22" '
+                                 f'font-family="sans-serif">{name}</text>'
+                                 f'<text x="{bx + 210:.1f}" y="{ty:.1f}" fill="{col}" font-size="32" font-weight="bold" '
+                                 f'font-family="sans-serif">{num}</text>'
+                                 f'<text x="{bx + 210:.1f}" y="{ty + 20:.1f}" fill="#9fb3c8" font-size="16" '
+                                 f'font-family="sans-serif">{sub}</text>')
+                if note:
+                    parts.append(f'<text x="{bx + 18:.1f}" y="{by + bh - 14:.1f}" fill="#9fb3c8" font-size="16" '
+                                 f'font-family="sans-serif">{note}</text>')
             parts.append("</g>")
             for metres in (0.5, 1, 2, 5, 10, 20):  # scale bar, top left: 60–220 px long
                 if 60 <= metres * s <= 220 or metres == 20:
@@ -2234,8 +2392,8 @@ class FrameSettings(Gtk.Window):
                          f'fill="#ffffff"/><text x="{ccx}" y="{ccy + 56}" fill="#9fb3c8" font-size="15" '
                          f'text-anchor="middle" font-family="sans-serif">start</text>')
             parts.append(f'<text x="{w / 2}" y="{h - 74}" fill="#c9d6e3" font-size="17" text-anchor="middle" '
-                         f'font-family="sans-serif">{house_map.TARGETS[target]} · yellow arrow = you · grey = not measured · '
-                         f'drag to move</text>')
+                         f'font-family="sans-serif">{house_map.TARGETS[target]} · yellow arrow = you · {html.escape(hint)}'
+                         f'</text>')
             parts.append(wifi_map.legend_svg(pad, h - 46, w - 2 * pad))
             svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">{"".join(parts)}</svg>'
         loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
@@ -2484,6 +2642,8 @@ class FrameSettings(Gtk.Window):
 
     def on_label_mode(self, mode):
         self._label_sel = None
+        if self.map_tool != "labels":
+            self.set_map_tool("labels", redraw=False)
         self.label_status.set_text({
             "add": "Add: pick a name, then tap the map where it is.",
             "move": "Move: tap a label, then tap where it goes.",
@@ -2493,6 +2653,8 @@ class FrameSettings(Gtk.Window):
             self.redraw_house_live()
 
     def on_label_name(self, name):
+        if self.map_tool != "labels":
+            self.set_map_tool("labels")
         if self.label_custom.get_text():
             self.label_custom.set_text("")  # a picked name replaces a typed one
         if self.label_mode.value == "add":

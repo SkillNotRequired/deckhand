@@ -71,8 +71,9 @@ rooms and maps. From Konsole: `~/Deckhand/uninstall.sh` (or `--keep-data`).
 
 ## Notes
 
-- The house map shows where you walked (dashed edge), your path, labels and a yellow "You" arrow. Drag it
-  to move it, and rotate or zoom it with the buttons under it.
+- The house map shows where you walked (dashed edge), your path, labels and a yellow "You" arrow. Pick a
+  tool above it: **Move** (drag), **Zoom** (tap to zoom in there, right-click to zoom out), **Labels**, or
+  **Signal** (tap a spot to see both links' strength there). Rotate / zoom / find me / reset are below it.
 - Signal maps use a colour-blind-safe gradient (dark purple = weak → yellow = strong) with a dBm scale.
 - The dongle's strength is how loudly the Frame hears the PC's dongle (its 6 GHz link); it only shows
   while the PC and Steam are on.
