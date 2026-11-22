@@ -11,7 +11,7 @@ set -euo pipefail
 REPO="SkillNotRequired/deckhand"
 DEST="${DECKHAND_DIR:-$HOME/Deckhand}"
 # An earlier install under the old name stays where it is (its services point there).
-[ -z "${DECKHAND_DIR:-}" ] && [ ! -d "$DEST" ] && [ -f "$HOME/FrameSettings/frame_settings.py" ] && DEST="$HOME/FrameSettings"
+[ -z "${DECKHAND_DIR:-}" ] && [ ! -d "$DEST" ] && { [ -f "$HOME/FrameSettings/frame_settings.py" ] || [ -f "$HOME/FrameSettings/app/deckhand.py" ]; } && DEST="$HOME/FrameSettings"
 
 say() { printf '\n\033[1;36m%s\033[0m\n' "$*"; }
 
@@ -23,19 +23,21 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/main" | tar -xz -C "$TMP"
 SRC=$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)
-[ -f "$SRC/frame_settings.py" ] || { echo "Download looks wrong; nothing installed." >&2; exit 1; }
+[ -f "$SRC/app/deckhand.py" ] || { echo "Download looks wrong; nothing installed." >&2; exit 1; }
 
 say "Installing to $DEST"
 mkdir -p "$DEST"
 cp -a "$SRC/." "$DEST/"
-chmod +x "$DEST"/*.sh "$DEST/frame_settings.py"
+chmod +x "$DEST"/*.sh "$DEST"/helpers/*.sh "$DEST/app/deckhand.py"
+python3 "$DEST/app/updater.py" cleanup   # tidy an older install's flat layout
 
 say "Building helpers (a few seconds)…"
-bash "$DEST/build.sh"
+bash "$DEST/helpers/build.sh"
+python3 "$DEST/app/updater.py" migrate >/dev/null 2>&1 || true   # services follow the app
 
 if [ -z "${DECKHAND_SKIP_SHORTCUT:-}" ]; then  # (set it to test an install without touching Steam)
   say "Adding it to Steam and the app menu…"
-  if ! python3 "$DEST/steam_shortcut.py"; then
+  if ! python3 "$DEST/app/steam_shortcut.py"; then
     echo "(The app menu entry is in. For the Steam library, add $DEST/launch.sh as a Non-Steam Game.)"
   fi
 fi

@@ -21,14 +21,15 @@ import sys
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)  # the install folder
 NAME = "Deckhand"
 OLD_NAMES = ["Frame Settings"]  # earlier name: renamed in place, not duplicated
-EXE = os.path.join(HERE, "launch.sh")
-ART = os.path.join(HERE, "assets", "steam")
+EXE = os.path.join(ROOT, "launch.sh")
+ART = os.path.join(ROOT, "assets", "steam")
 ICON = os.path.join(ART, "icon.png")
 # Steam's library asset types for SetCustomArtworkForApp
 ARTWORK = {"portrait.png": 0, "hero.png": 1, "logo.png": 2, "capsule.png": 3}
-APP_ID = "deckhand"  # window class set by frame_settings.py
+APP_ID = "deckhand"  # window class set by app/deckhand.py
 OLD_APP_IDS = ["frame-settings"]
 DESKTOP_FILE = os.path.expanduser(f"~/.local/share/applications/{APP_ID}.desktop")
 THEME_ICON = os.path.expanduser(f"~/.local/share/icons/hicolor/256x256/apps/{APP_ID}.png")
@@ -133,10 +134,10 @@ const findShortcut = (...names) => {
 
 
 def add():
-    for path in (EXE, os.path.join(HERE, "frame_settings.py")):
+    for path in (EXE, os.path.join(HERE, "deckhand.py")):
         if not os.path.isfile(path):
             raise SystemExit(f"missing {path}")
-    args = json.dumps({"name": NAME, "old": OLD_NAMES, "exe": f'"{EXE}"', "dir": f'"{HERE}"',
+    args = json.dumps({"name": NAME, "old": OLD_NAMES, "exe": f'"{EXE}"', "dir": f'"{ROOT}"',
                        "icon": ICON if os.path.isfile(ICON) else ""})
     js = f"""
 (async () => {{
@@ -194,7 +195,7 @@ def install_desktop_entry():
     with open(DESKTOP_FILE, "w", encoding="utf-8") as f:
         f.write("[Desktop Entry]\nType=Application\n"
                 f"Name={NAME}\nComment=Fan, power, timers, rooms, Wi-Fi maps and recline for the Steam Frame\n"
-                f"Exec={EXE}\nPath={HERE}\nIcon={APP_ID}\nStartupWMClass={APP_ID}\n"
+                f"Exec={EXE}\nPath={ROOT}\nIcon={APP_ID}\nStartupWMClass={APP_ID}\n"
                 "Categories=Utility;\nTerminal=false\n")
     os.chmod(DESKTOP_FILE, 0o755)
     print(f"app menu entry: {DESKTOP_FILE}\nicon: {THEME_ICON}")

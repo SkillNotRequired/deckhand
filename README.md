@@ -39,9 +39,25 @@ sudo ~/Deckhand/setup.sh
 No password yet? Set one with `passwd`. This installs only a small fan helper that the app may run
 without a password; `sudo ~/Deckhand/setup.sh remove` undoes it and puts the fan back to stock.
 
+## What's in the folder
+
+```
+Deckhand/
+├── install.sh     install or reinstall (the one-line command runs this)
+├── uninstall.sh   remove everything (System tab > Remove Deckhand runs this)
+├── setup.sh       optional, once, with sudo: lets the app change the fan
+├── launch.sh      what Steam starts
+├── app/           the app (deckhand.py) and its parts
+├── helpers/       small native SteamVR helpers: src/ is built into bin/ on the Frame
+├── assets/        icon and Steam artwork
+├── tools/         artwork generator (only needed on a PC)
+└── logs/          run logs, for troubleshooting
+```
+
 ## Update
 
-System tab > **Update app**. Or run the install command again. Your settings, rooms and maps are kept
+System tab > **Check for update**, then **Update**, then **Restart Deckhand**. Or run the install
+command again (do that once if you installed 1.0.4 or older: the folder layout changed in 1.0.5). Your settings, rooms and maps are kept
 (they live in `~/.config/frame-settings` and `~/.local/share/frame-settings`).
 
 ## Remove

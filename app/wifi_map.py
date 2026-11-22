@@ -18,7 +18,8 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SPACE_TOOL = os.path.join(HERE, "space_tool")
+import paths  # noqa: E402
+SPACE_TOOL = paths.tool("space_tool")
 MAPS = os.path.expanduser("~/.local/share/frame-settings/wifi")
 CELL = 0.5          # metres per square
 MAX_SECONDS = 300   # mapping stops by itself after 5 min
@@ -179,7 +180,7 @@ class Recorder:
 
     def start(self):
         if not os.access(SPACE_TOOL, os.X_OK):
-            raise RuntimeError("space_tool is missing: run build.sh on the Frame")
+            raise RuntimeError("space_tool is missing: run helpers/build.sh on the Frame")
         self.iface, self.ap = station_interface(), ap_interface()
         if not signal(self.iface) and not dongle_signal(self.ap):
             raise RuntimeError("neither home Wi-Fi nor the Steam dongle is connected")

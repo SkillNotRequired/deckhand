@@ -22,7 +22,8 @@ HELPER_DIR=/etc/frame-settings
 HELPER=$HELPER_DIR/fanmode
 SUDOERS=/etc/sudoers.d/zz-frame-settings
 OLD_SUDOERS=/etc/sudoers.d/frame-settings
-LOG=$HERE/setup.log
+mkdir -p "$HERE/logs"
+LOG=$HERE/logs/setup.log
 
 # Everything below also goes to setup.log (readable without root) for troubleshooting.
 exec > >(tee "$LOG") 2>&1
@@ -33,7 +34,7 @@ case "${1:-install}" in
   install)
     set -e
     install -d -m 755 -o root -g root "$HELPER_DIR"
-    install -m 755 -o root -g root "$HERE/fanmode.sh" "$HELPER"
+    install -m 755 -o root -g root "$HERE/helpers/fanmode.sh" "$HELPER"
     tmp=$(mktemp)
     printf '%s ALL=(root) NOPASSWD: %s\n' "$TARGET_USER" "$HELPER" > "$tmp"
     if ! visudo -cqf "$tmp"; then rm -f "$tmp"; echo "sudoers rule failed validation; nothing changed"; exit 1; fi

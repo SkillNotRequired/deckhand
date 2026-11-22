@@ -50,7 +50,7 @@ if [ -e /etc/frame-settings/fanmode ]; then
 fi
 
 # Steam library shortcut, app-menu entry, icon
-act env -u SteamAppId -u SteamGameId -u LD_PRELOAD python3 "$HERE/steam_shortcut.py" remove \
+act env -u SteamAppId -u SteamGameId -u LD_PRELOAD python3 "$HERE/app/steam_shortcut.py" remove \
   || echo "(Steam shortcut: remove it from the library by hand if it's still there)"
 
 # Data
@@ -62,7 +62,7 @@ else
 fi
 
 # The app itself (only a folder that really is Deckhand)
-if [ -f "$HERE/frame_settings.py" ] && [ -f "$HERE/updater.py" ] && [ "$HERE" != "$HOME" ] && [ "$HERE" != "/" ]; then
+if [ -f "$HERE/app/deckhand.py" ] && [ -f "$HERE/app/updater.py" ] && [ "$HERE" != "$HOME" ] && [ "$HERE" != "/" ]; then
   act rm -rf "$HERE"
 fi
 

@@ -71,7 +71,7 @@ class HouseRecorder:
 
     def start(self, segment_offset=0):
         if not os.access(wifi_map.SPACE_TOOL, os.X_OK):
-            raise RuntimeError("space_tool is missing: run build.sh on the Frame")
+            raise RuntimeError("space_tool is missing: run helpers/build.sh on the Frame")
         self.iface, self.ap = wifi_map.station_interface(), ap_interface()
         self.segment = segment_offset
         self.proc = subprocess.Popen([wifi_map.SPACE_TOOL, "track", "200"], stdout=subprocess.PIPE,

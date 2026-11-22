@@ -26,10 +26,11 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+import paths  # noqa: E402
 CFG_DIR = os.path.expanduser("~/.config/frame-settings")
 CFG = os.environ.get("FRAME_POWER_CONFIG") or os.path.join(CFG_DIR, "power.json")  # override for tests
 STATUS = os.path.expanduser("~/.cache/frame-settings/power-status.json")
-LOG = os.path.join(HERE, "power.log")
+LOG = os.path.join(paths.LOGS, "power.log")
 HELPER = "/etc/frame-settings/fanmode"
 UNIT_NAME = "frame-autooff.service"
 UNIT_PATH = os.path.expanduser(f"~/.config/systemd/user/{UNIT_NAME}")

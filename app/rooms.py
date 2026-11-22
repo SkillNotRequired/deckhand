@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import time
+import paths  # noqa: E402  (where the native helpers are)
 
 CFG = os.path.expanduser("~/.config/openvr/config")
 VRCHAP = os.path.join(CFG, "chaperone_info.vrchap")
@@ -300,7 +301,7 @@ def quick_apply(room_id):
     SteamVR restart if tracking doesn't come back.
     """
     src = room_dir(room_id)
-    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chaperone_tool")
+    tool = paths.tool("chaperone_tool")
     pid = _pid("XRService")
     if not pid or not _pid("vrserver"):
         log(f"quick load {room_id}: SteamVR/tracking not running; doing a full load")

@@ -18,7 +18,8 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.environ.get("FRAME_REMINDER_BIN") or os.path.join(HERE, "timer_overlay")  # override: tests only
+import paths  # noqa: E402
+BIN = os.environ.get("FRAME_REMINDER_BIN") or paths.tool("timer_overlay")  # override: tests only
 DATA = os.path.expanduser("~/.local/share/frame-settings/reminders")
 UNIT_DIR = os.path.expanduser("~/.config/systemd/user")
 
@@ -47,7 +48,7 @@ def add(rid, when, text):
     if when <= time.time():
         return False, "that time has already passed"
     if not os.access(BIN, os.X_OK):
-        return False, "timer_overlay is missing: run build.sh on the Frame"
+        return False, "timer_overlay is missing: run helpers/build.sh on the Frame"
     d = os.path.join(DATA, rid)
     with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
         json.dump({"id": rid, "when": when, "text": text, "created": time.time()}, f)

@@ -5,4 +5,5 @@
 HERE=$(cd "$(dirname "$0")" && pwd)
 unset LD_PRELOAD LD_LIBRARY_PATH PYTHONHOME PYTHONPATH
 export GDK_BACKEND=x11
-exec /usr/bin/python3 "$HERE/frame_settings.py" "$@" >"$HERE/last-run.log" 2>&1
+mkdir -p "$HERE/logs"
+exec /usr/bin/python3 "$HERE/app/deckhand.py" "$@" >"$HERE/logs/last-run.log" 2>&1

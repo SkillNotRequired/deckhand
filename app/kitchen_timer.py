@@ -12,7 +12,8 @@ import subprocess
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.path.join(HERE, "timer_overlay")
+import paths  # noqa: E402
+BIN = paths.tool("timer_overlay")
 IMG_DIR = os.path.expanduser("~/.cache/frame-settings/timer")
 STATE = os.path.expanduser("~/.config/frame-settings/timer.json")
 UNIT = "frame-kitchen-timer"
@@ -55,7 +56,7 @@ def cancel():
 def start(seconds, label):
     """Starts the background job. Pictures must already be in IMG_DIR. Returns (ok, message)."""
     if not os.access(BIN, os.X_OK):
-        return False, "timer_overlay is missing: run build.sh on the Frame"
+        return False, "timer_overlay is missing: run helpers/build.sh on the Frame"
     cancel()
     _systemctl("reset-failed", UNIT)
     end = time.time() + seconds

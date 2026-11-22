@@ -38,8 +38,10 @@ GLib.set_application_name("Deckhand")
 Gdk.set_program_class("deckhand")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-APP_ICON = os.path.join(HERE, "assets", "steam", "icon.png")
 sys.path.insert(0, HERE)
+import paths  # noqa: E402  (install folder layout)
+ROOT = paths.ROOT
+APP_ICON = paths.ICON
 import power  # noqa: E402  (same folder: shutdown, sleep timer, auto shut-off)
 import kitchen_timer  # noqa: E402  (countdown popup in the headset)
 import rooms  # noqa: E402  (saved play areas, experimental)
@@ -351,6 +353,8 @@ button.primary {{ background: #2a6f97; }}
 button.primary:hover {{ background: #3282b0; }}
 button.danger {{ background: #8a2f2f; font-size: 19pt; min-height: 92px; }}
 button.danger:hover {{ background: #a33939; }}
+progressbar.hold trough {{ min-height: 16px; border-radius: 8px; background: #2c3b4b; }}
+progressbar.hold progress {{ min-height: 16px; border-radius: 8px; background: #f2a33a; }}
 button.armed {{ background: #d04040; }}
 button.selected {{ background: #22384d; border-color: {ACCENT}; color: #ffffff; }}
 button.tile {{ padding: 16px 22px; min-height: 130px; }}
@@ -595,6 +599,49 @@ class ConfirmButton(Gtk.Button):
         return False
 
 
+class HoldButton(Gtk.Box):
+    """Press and HOLD for `seconds` to do it: a bar fills and the label counts down; letting go (or
+    moving off the button) before the end cancels. For things that can't be undone."""
+
+    def __init__(self, text, action, seconds=5.0, css="danger"):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.text, self.action, self.seconds = text, action, seconds
+        self.button = add_class(Gtk.Button(label=text), css)
+        self.bar = add_class(Gtk.ProgressBar(), "hold")
+        self.pack_start(self.button, False, False, 0)
+        self.pack_start(self.bar, False, False, 0)
+        self.started = None
+        self.button.connect("button-press-event", self._press)
+        self.button.connect("button-release-event", self._cancel)
+        self.button.connect("leave-notify-event", self._cancel)
+
+    def _press(self, _w, event):
+        if event.button == 1 and self.started is None:
+            self.started = time.monotonic()
+            GLib.timeout_add(50, self._tick)
+        return False
+
+    def _tick(self):
+        if self.started is None:
+            return False
+        held = time.monotonic() - self.started
+        self.bar.set_fraction(min(1.0, held / self.seconds))
+        if held >= self.seconds:
+            self.started = None
+            self.button.set_label("Done")
+            self.action()
+            return False
+        self.button.set_label(f"Keep holding… {self.seconds - held:.1f} s")
+        return True
+
+    def _cancel(self, *_):
+        if self.started is not None:
+            self.started = None
+            self.bar.set_fraction(0)
+            self.button.set_label(self.text)
+        return False
+
+
 class HudRenderer:
     """Draws the headset popup pictures (pixel sizes, not DPI) as raw RGBA files for
     timer_overlay: 8-byte header (uint32 width, height, little endian) + pixels."""
@@ -652,7 +699,7 @@ class HudRenderer:
 
 
 class FrameSettings(Gtk.Window):
-    PAGES = [("Fan", os.path.join(HERE, "assets", "steam", "icon.png")),
+    PAGES = [("Fan", paths.ICON),
              ("Power", ["system-shutdown"]),
              ("Timer", ["chronometer", "alarm-symbolic", "appointment-soon", "preferences-system-time"]),
              ("Reminders", ["appointment-new", "x-office-calendar", "office-calendar", "view-calendar"]),
@@ -709,6 +756,7 @@ class FrameSettings(Gtk.Window):
         self.refresh_power()
         self.refresh_live()
         self.show_page("Fan")
+        in_background(updater.migrate_units, lambda _r: None)
         # Light on battery: live numbers every 3 s, the timer clock every 1 s only while its page
         # shows, and nothing at all while the window isn't focused (refreshed again on return).
         self.connect("focus-out-event", self.on_focus_change, False)
@@ -735,7 +783,7 @@ class FrameSettings(Gtk.Window):
         rail = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), "rail")
         rail.set_size_request(330, -1)
         head = Gtk.Box(spacing=14, margin_bottom=18)
-        head.pack_start(icon_image(os.path.join(HERE, "assets", "steam", "icon.png"), 64), False, False, 0)
+        head.pack_start(icon_image(paths.ICON, 64), False, False, 0)
         head.pack_start(label("Deckhand", "app-title"), False, False, 0)
         rail.pack_start(head, False, False, 0)
         self.nav = {}
@@ -764,7 +812,8 @@ class FrameSettings(Gtk.Window):
         {"Power": self.refresh_power, "Comfort": self.refresh_comfort,
          "Recline": self.refresh_recline, "System": self.refresh_system,
          "Timer": self.tick_timer, "Rooms": self.refresh_rooms,
-         "System": lambda: (self.refresh_system(), None if self.upd_checked else self.on_update_check()),
+         "System": lambda: (self.refresh_system(), self.show_restart_if_needed(),
+                            None if self.upd_checked else self.on_update_check()),
          "Reminders": self.refresh_reminders, "Signal": self.refresh_signal,
          "WifiMap": lambda: self.refresh_wifi(full=True), "House": lambda: self.refresh_house(full=True),
          }.get(name, lambda: None)()
@@ -841,7 +890,7 @@ class FrameSettings(Gtk.Window):
         setup_btn.connect("clicked", self.on_run_setup)
         self.setup_box.pack_start(setup_btn, False, False, 0)
         cmd = Gtk.Entry()
-        cmd.set_text(f"sudo {os.path.join(HERE, 'setup.sh')}")
+        cmd.set_text(f"sudo {os.path.join(ROOT, 'setup.sh')}")
         cmd.set_editable(False)
         self.setup_box.pack_start(cmd, False, False, 0)
 
@@ -948,7 +997,7 @@ class FrameSettings(Gtk.Window):
 
     def on_run_setup(self, *_):
         """Opens a terminal running the setup, so the password is typed there (never here)."""
-        setup = os.path.join(HERE, "setup.sh")
+        setup = os.path.join(ROOT, "setup.sh")
         for term in (["konsole", "--hold", "-e"], ["xterm", "-hold", "-e"]):
             try:
                 subprocess.Popen([*term, "sudo", setup], start_new_session=True)
@@ -2557,7 +2606,8 @@ class FrameSettings(Gtk.Window):
 
         upd = card("Update app", "Gets the newest Deckhand from GitHub. Your settings, rooms, maps and "
                                  "timers stay as they are.")
-        self.upd_lbl = label(f"Installed: version {updater.local_version()}", "status", wrap=True)
+        self.started_version = updater.local_version()  # what this window is running
+        self.upd_lbl = label(f"Installed: version {self.started_version}", "status", wrap=True)
         upd.pack_start(self.upd_lbl, False, False, 0)
         ubox = Gtk.Box(spacing=10, homogeneous=True)
         self.upd_btn = Gtk.Button(label="Check for update")
@@ -2565,9 +2615,13 @@ class FrameSettings(Gtk.Window):
         ubox.pack_start(self.upd_btn, True, True, 0)
         self.upd_go = add_class(Gtk.Button(label="Update"), "primary")
         self.upd_go.connect("clicked", self.on_update_install)
-        self.upd_go.set_no_show_all(True)  # only once a newer version is found
+        self.upd_go.set_sensitive(False)  # greyed out until a newer version is found
         ubox.pack_start(self.upd_go, True, True, 0)
         upd.pack_start(ubox, False, False, 0)
+        self.upd_restart = add_class(Gtk.Button(label="Restart Deckhand to use the new version"), "primary")
+        self.upd_restart.connect("clicked", lambda *_: self.restart_self())
+        self.upd_restart.set_no_show_all(True)  # shown once a new version is installed
+        upd.pack_start(self.upd_restart, False, False, 0)
         self.upd_new = None
         self.upd_checked = False
         share = card("Share with a friend", "On their Steam Frame, in Desktop mode, open Konsole and paste:")
@@ -2593,13 +2647,14 @@ class FrameSettings(Gtk.Window):
         rrow = Gtk.Box(spacing=10, homogeneous=True)
         cancel = Gtk.Button(label="Cancel")
         cancel.connect("clicked", lambda *_: (self.rm_box.hide(), self.rm_open.show()))
+        cancel.set_valign(Gtk.Align.START)
         rrow.pack_start(cancel, True, True, 0)
-        rrow.pack_start(ConfirmButton("Remove everything", "Tap again: removes Deckhand", self.do_remove_all),
+        rrow.pack_start(HoldButton("Hold 5 s to remove everything", self.do_remove_all, seconds=5.0),
                         True, True, 0)
         self.rm_box.pack_start(rrow, False, False, 0)
         rm.pack_start(self.rm_box, False, False, 0)
         box.pack_start(rm, False, False, 0)
-        box.pack_start(label(f"Deckhand lives in {HERE}", "desc", wrap=True), False, False, 0)
+        box.pack_start(label(f"Deckhand lives in {ROOT}", "desc", wrap=True), False, False, 0)
         return box
 
     def on_update_check(self, *_):
@@ -2617,12 +2672,23 @@ class FrameSettings(Gtk.Window):
                 self.upd_new = there
                 set_result(self.upd_lbl, f"Version {there} is out (you have {here}).", True)
                 self.upd_go.set_label(f"Update to {there}")
-                self.upd_go.show()
+                self.upd_go.set_sensitive(True)
             else:
                 self.upd_new = None
-                self.upd_go.hide()
+                self.upd_go.set_label("Update")
+                self.upd_go.set_sensitive(False)
                 set_result(self.upd_lbl, f"Up to date: version {here}.", True)
+            self.show_restart_if_needed()
         in_background(updater.check, checked)
+
+    def show_restart_if_needed(self):
+        """A newer version is installed than this window is running (updated, or files replaced)."""
+        installed = updater.local_version()
+        if installed != self.started_version:
+            set_result(self.upd_lbl, f"Version {installed} is installed. Restart Deckhand to use it "
+                                     f"(this window is still {self.started_version}).", True)
+            self.upd_restart.set_no_show_all(False)
+            self.upd_restart.show()
 
     def on_update_install(self, *_):
         if not self.upd_new:
@@ -2633,12 +2699,14 @@ class FrameSettings(Gtk.Window):
 
         def done(res):
             self.upd_btn.set_sensitive(True)
-            self.upd_go.set_sensitive(True)
             if isinstance(res, Exception):
+                self.upd_go.set_sensitive(True)
                 set_result(self.upd_lbl, f"Update failed: {res}", False)
                 return
-            set_result(self.upd_lbl, f"Updated to version {res}. Restarting the app…", True)
-            GLib.timeout_add(1500, self.restart_self)
+            self.upd_new = None
+            self.upd_go.set_label("Update")
+            self.upd_go.set_sensitive(False)
+            self.show_restart_if_needed()
         in_background(lambda: updater.install(log=lambda _m: None), done)
 
     def refresh_remove_warning(self):
@@ -2670,7 +2738,7 @@ class FrameSettings(Gtk.Window):
         if not vr_get("userinterface", "screenshots", "bool", True):
             vr_set("userinterface", "screenshots", "bool", True)
         args = ["systemd-run", "--user", "--quiet", "--collect", "--unit=deckhand-uninstall",
-                "/bin/bash", os.path.join(HERE, "uninstall.sh")]
+                "/bin/bash", os.path.join(ROOT, "uninstall.sh")]
         if self.rm_keep.get_active():
             args.append("--keep-data")
         r = subprocess.run(args, capture_output=True, text=True)
@@ -2686,7 +2754,12 @@ class FrameSettings(Gtk.Window):
             self.stop_wifi_mapping()
         if getattr(self, "house_rec", None):
             self.stop_house_walk()
-        os.execv(sys.executable, [sys.executable, os.path.join(HERE, "frame_settings.py")])
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.execv(sys.executable, [sys.executable, os.path.join(HERE, "deckhand.py")])
+        except OSError as e:
+            set_result(self.upd_lbl, f"Couldn't restart ({e}). Close Deckhand and open it again.", False)
         return False
 
     def refresh_system(self):
@@ -2706,7 +2779,7 @@ def snapshot(prefix):
     """Render every page to PNGs as a real full-screen window.
 
     Only on a virtual display, so nothing ever pops up in the headset, e.g.:
-      GDK_DPI_SCALE=1.5 xvfb-run -a -s "-screen 0 1920x1080x24" python3 frame_settings.py --snapshot /tmp/x
+      GDK_DPI_SCALE=1.5 xvfb-run -a -s "-screen 0 1920x1080x24" python3 app/deckhand.py --snapshot /tmp/x
     (GDK_DPI_SCALE=1.5 matches the headset's 144 dpi text scaling.)
     """
     if os.environ.get("DISPLAY") in (":0", ":1"):

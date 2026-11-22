@@ -16,10 +16,11 @@ import subprocess
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+import paths  # noqa: E402
 CONF = os.path.expanduser("~/.config/frame-settings/ceiling.conf")
 DATA = os.path.expanduser("~/.local/share/frame-settings/ceiling")
-SPACE_TOOL = os.path.join(HERE, "space_tool")
-BIN = os.path.join(HERE, "ceiling_overlay")
+SPACE_TOOL = paths.tool("space_tool")
+BIN = paths.tool("ceiling_overlay")
 UNIT = "frame-ceiling.service"
 UNIT_PATH = os.path.expanduser(f"~/.config/systemd/user/{UNIT}")
 DEFAULTS = {"height": 2.40, "cx": 0.0, "cz": 0.0, "near": 1, "near_dist": 0.40, "always": 0,
@@ -76,7 +77,7 @@ def apply_service(c):
     want = bool(c.get("enabled")) and any_mode(c)
     if want:
         if not os.access(BIN, os.X_OK):
-            return False, "ceiling_overlay is missing: run build.sh on the Frame"
+            return False, "ceiling_overlay is missing: run helpers/build.sh on the Frame"
         current = None
         try:
             with open(UNIT_PATH, encoding="utf-8") as f:
