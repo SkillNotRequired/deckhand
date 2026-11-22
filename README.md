@@ -17,7 +17,15 @@ doesn't have (yet). Runs from your Steam library, in VR, no desktop mode needed.
 | **Rooms** | Save and name play areas, preview them, load one instead of redrawing the boundary. Ceiling indicator for lying down. |
 | **Signal** | Home Wi-Fi *and* Steam dongle signal, live. Play-space map shows the best spot to stand; whole-house map walks your home into a floor plan coloured by signal that you can drag, rotate and zoom, with a "You" marker and a game-style mini-map in the middle of your view. |
 | **Recline** | Controls for Recline VR (play lying down). |
-| **System** | Headset info, restart SteamVR, **Update app**. |
+| **System** | Headset info, restart SteamVR, **Update app**, **Debug log**. |
+
+**Debug log** (System › Debug log, on by default): one timeline of everything Deckhand does (taps, pages,
+the programs it runs, messages, errors) and of what the cameras and SteamVR do (camera processor faults
+and resets, colour camera drop-outs, headset on and off, SteamVR stops, starts and crashes, temperatures
+once a minute). A small background job (`frame-camwatch.service`) keeps recording while Deckhand is closed;
+it only reads the system logs. The log is `~/Deckhand/logs/debug.log`; **Save report** writes a shareable
+copy to `~/Documents/Deckhand`. If the camera processor gets stuck (green or black passthrough), the side
+menu says so: only a full reboot of the Frame clears that, a SteamVR restart doesn't.
 
 ## Install
 

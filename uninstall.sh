@@ -24,15 +24,15 @@ echo "Removing Deckhand from $HERE  $(date -Is)  keep-data=$KEEP${DRY:+  (dry ru
 
 # Background services
 UNITS=~/.config/systemd/user
-for unit in frame-autooff.service frame-ceiling.service frame-kitchen-timer.service frame-room-load.service \
-            frame-wifi-live.service frame-minimap.service \
+for unit in frame-autooff.service frame-ceiling.service frame-camwatch.service frame-kitchen-timer.service \
+            frame-room-load.service frame-wifi-live.service frame-minimap.service \
             $(cd "$UNITS" 2>/dev/null && ls frame-reminder-*.timer frame-reminder-*.service 2>/dev/null); do
   if systemctl --user cat "$unit" >/dev/null 2>&1 || systemctl --user is-active --quiet "$unit"; then
     act systemctl --user disable --now "$unit"
     act systemctl --user stop "$unit"
   fi
 done
-for f in "$UNITS"/frame-autooff.service "$UNITS"/frame-ceiling.service \
+for f in "$UNITS"/frame-autooff.service "$UNITS"/frame-ceiling.service "$UNITS"/frame-camwatch.service \
          "$UNITS"/frame-reminder-*.service "$UNITS"/frame-reminder-*.timer; do
   [ -e "$f" ] && act rm -f "$f"
 done
@@ -67,6 +67,19 @@ if [ "$KEEP" = 0 ]; then
   act rm -rf ~/.config/frame-settings ~/.local/share/frame-settings ~/Documents/Deckhand
 else
   echo "keeping: ~/.config/frame-settings ~/.local/share/frame-settings ~/Documents/Deckhand"
+fi
+
+# The debug log is kept (it is the record of what happened, e.g. before Deckhand was removed):
+# its files, oldest first, become one file in your home folder.
+if [ -s "$HERE/logs/debug.log" ]; then
+  KEPT_LOG=~/deckhand-debug-$(date +%Y%m%d-%H%M%S).log
+  if [ -n "$DRY" ]; then
+    echo "would keep the debug log as $KEPT_LOG"
+  else
+    for f in "$HERE"/logs/debug.log.3 "$HERE"/logs/debug.log.2 "$HERE"/logs/debug.log.1 "$HERE"/logs/debug.log; do
+      [ -f "$f" ] && cat "$f"
+    done > "$KEPT_LOG" && echo "Kept the debug log: $KEPT_LOG"
+  fi
 fi
 
 # The app itself: only a folder that really is Deckhand, only Deckhand's own files in it, then the

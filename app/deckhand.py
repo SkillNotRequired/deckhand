@@ -55,6 +55,9 @@ import wifi_map  # noqa: E402  (Wi-Fi signal map of the play space)
 import ceiling  # noqa: E402  (ceiling indicator)
 import house_map  # noqa: E402  (whole-house Wi-Fi walk)
 import updater  # noqa: E402  (Update app: newest version from GitHub)
+import debuglog  # noqa: E402  (debug log: one timeline of the app, the cameras and SteamVR)
+import camwatch  # noqa: E402  (its background part: camera and SteamVR events from the journal)
+import steam_shortcut  # noqa: E402  (Steam client calls, here: restart the Frame)
 import datetime  # noqa: E402
 import struct  # noqa: E402
 
@@ -404,6 +407,10 @@ tooltip, tooltip * {{ font-size: 14pt; }}
 .hud-time {{ font-size: 132px; font-weight: bold; color: #ffffff; }}
 .hud-done {{ font-size: 90px; font-weight: bold; color: #ffcf5c; }}
 .hud-note {{ font-size: 60px; font-weight: bold; color: #ffcf5c; }}
+.rail-warn {{ color: #ffcf5c; font-weight: bold; }}
+.warn {{ color: #ffcf5c; }}
+.debug-view {{ font-size: 19px; }}
+.debug-view text {{ background-color: #0e141b; color: #c9d6e3; }}
 .spin-value {{ font-size: 26pt; font-weight: bold; }}
 """.encode()
 
@@ -482,6 +489,7 @@ def set_result(lab, text, ok):
     ctx.remove_class("err")
     ctx.add_class("ok" if ok else "err")
     lab.set_text(text)
+    debuglog.log("app", "message", ("" if ok else "PROBLEM: ") + text)
 
 
 def set_info(lab, text):
@@ -500,17 +508,26 @@ def safe(fn):
             return fn(*args)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+            debuglog.log("app", "error", f"{job_name(fn)}: {traceback.format_exc(limit=4)}")
             return True
     return run_safely
+
+
+def job_name(fn):
+    return getattr(fn, "__qualname__", None) or repr(fn)
 
 
 def in_background(work, done):
     """Runs work() off the UI thread, then done(result) on it."""
     def runner():
+        t0 = time.monotonic()
         try:
             result = work()
         except Exception as e:  # noqa: BLE001
             result = e
+            debuglog.log("app", "error", f"{job_name(work)}: {type(e).__name__}: {e}")
+        if time.monotonic() - t0 > 3:
+            debuglog.log("app", "slow", f"{job_name(work)} took {time.monotonic() - t0:.1f} s")
         GLib.idle_add(lambda: (done(result), False)[1])
     threading.Thread(target=runner, daemon=True).start()
 
@@ -533,6 +550,7 @@ class SerialJobs:
                 result = work()
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
+                debuglog.log("app", "error", f"{job_name(work)}: {type(e).__name__}: {e}")
                 result = e
             if done:
                 GLib.idle_add(lambda d=done, r=result: (d(r), False)[1])
@@ -545,6 +563,78 @@ def user_systemctl(*args):
 def dbm_text(s):
     """A reading's strength as a short number ("-52"), or "--" without one."""
     return f"{s['dbm']:.0f}" if s and s.get("dbm") is not None else "--"
+
+
+def widget_text(w):
+    """The words a person sees on a button: its label, or the first label inside it."""
+    try:
+        text = w.get_label()
+    except (AttributeError, TypeError):
+        text = None
+    if text:
+        return text
+    todo = [w]
+    while todo:
+        x = todo.pop(0)
+        if isinstance(x, Gtk.Label) and x.get_text().strip():
+            return x.get_text().strip()
+        if isinstance(x, Gtk.Container):
+            todo.extend(x.get_children())
+    return w.get_tooltip_text() or type(w).__name__
+
+
+def _cmd_text(args):
+    if isinstance(args, (list, tuple)) and args:
+        text = " ".join([os.path.basename(str(args[0]))] + [str(a) for a in args[1:]])
+    else:
+        text = str(args)
+    return text.replace(os.path.expanduser("~"), "~")[:300]
+
+
+def _quiet_cmd(args):
+    """Frequent read-only queries that would drown the debug log."""
+    if not isinstance(args, (list, tuple)) or not args:
+        return False
+    name = os.path.basename(str(args[0]))
+    return (name == "iw" or (name == "systemctl" and any(a in ("is-active", "show", "cat") for a in args))
+            or (name == "sudo" and args[-1] == "check"))
+
+
+def log_commands():
+    """Every program Deckhand starts goes into the debug log, with its exit code and how long it
+    took (frequent read-only queries excepted)."""
+    real_run, real_popen = subprocess.run, subprocess.Popen
+    inside = threading.local()
+
+    def run(args, *a, **k):
+        if _quiet_cmd(args) or not debuglog.enabled():
+            return real_run(args, *a, **k)
+        t0 = time.monotonic()
+        inside.run = True
+        try:
+            r = real_run(args, *a, **k)
+        except Exception as e:
+            debuglog.log("app", "run", f"{_cmd_text(args)} -> {type(e).__name__}: {e}")
+            raise
+        finally:
+            inside.run = False
+        err = ""
+        if r.returncode:
+            raw = r.stderr if r.stderr else r.stdout
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            err = (" | " + " ".join(str(raw).split())[:240]) if raw else ""
+        debuglog.log("app", "run", f"{_cmd_text(args)} -> exit {r.returncode} in {time.monotonic() - t0:.2f} s{err}")
+        return r
+
+    class LoggedPopen(real_popen):
+        def __init__(self, args, *a, **k):
+            super().__init__(args, *a, **k)
+            if not getattr(inside, "run", False) and not _quiet_cmd(args) and debuglog.enabled():
+                debuglog.log("app", "start", f"{_cmd_text(args)} (pid {self.pid})")
+
+    subprocess.run = run
+    subprocess.Popen = LoggedPopen
 
 
 def tracking_note(rec):
@@ -890,7 +980,8 @@ class FrameSettings(Gtk.Window):
             sw.add(builders[name]())
             self.stack.add_named(sw, name)
         for name, build in (("RoomPreview", self.build_room_preview_page), ("WifiMap", self.build_wifi_page),
-                            ("House", self.build_house_page), ("Ceiling", self.build_ceiling_page)):
+                            ("House", self.build_house_page), ("Ceiling", self.build_ceiling_page),
+                            ("Debug", self.build_debug_page)):
             sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
             sw.add(build())
             self.stack.add_named(sw, name)  # sub-pages of Rooms / Signal (no menu entry)
@@ -916,13 +1007,39 @@ class FrameSettings(Gtk.Window):
         # shows, and nothing at all while the window isn't focused (refreshed again on return).
         self.connect("focus-out-event", self.on_focus_change, False)
         self.connect("focus-in-event", self.on_focus_change, True)
+        if not offscreen:
+            self.log_ui()
         GLib.timeout_add_seconds(3, safe(self.refresh_live))
         GLib.timeout_add_seconds(1, safe(self.tick_timer))  # _seconds: wake-ups line up with others
+
+    def log_ui(self):
+        """Every tap on a button and every switch change goes into the debug log, with its page."""
+        if getattr(FrameSettings, "_ui_logged", False):
+            return
+        FrameSettings._ui_logged = True
+
+        def tap(button, *_):
+            debuglog.log("app", "tap", f"{self.stack.get_visible_child_name()} › {widget_text(button)}")
+            return True
+
+        def switch(sw, state=None, *_):
+            row = sw.get_parent()
+            kids = row.get_children() if row else []
+            title = widget_text(kids[0]) if kids and kids[0] is not sw else "switch"
+            debuglog.log("app", "switch", f"{self.stack.get_visible_child_name()} › {title}: "
+                                          f"{'on' if (sw.get_active() if state is None else state) else 'off'}")
+            return True
+        try:
+            GObject.add_emission_hook(Gtk.Button, "clicked", tap)
+            GObject.add_emission_hook(Gtk.Switch, "state-set", switch)
+        except Exception as e:  # noqa: BLE001 (logging must never stop the app)
+            debuglog.log("app", "error", f"can't follow taps: {e}")
 
     def on_close(self, *_):
         if getattr(self, "_closing", False):
             return
         self._closing = True
+        debuglog.log("app", "close", "Deckhand closing")
         if getattr(self, "wifi_rec", None):  # don't leave the in-view readout or tracking running
             self.stop_wifi_mapping()
         if getattr(self, "house_rec", None):
@@ -935,6 +1052,8 @@ class FrameSettings(Gtk.Window):
         Gtk.main_quit()
 
     def on_focus_change(self, _w, _ev, focused):
+        if focused != self.focused:
+            debuglog.log("app", "focus", "window focused" if focused else "window not focused")
         self.focused = focused
         if focused:
             self.refresh_live()
@@ -969,13 +1088,18 @@ class FrameSettings(Gtk.Window):
         rail.pack_end(close, False, False, 0)
         self.rail_status = label("", "rail-status", wrap=True)
         rail.pack_end(self.rail_status, False, False, 12)
+        self.rail_cam = label("", "rail-warn", wrap=True)  # "Camera stuck: reboot", from the camera watch
+        self.rail_cam.set_no_show_all(True)
+        rail.pack_end(self.rail_cam, False, False, 0)
         return rail
 
     def show_page(self, name):
+        debuglog.log("app", "page", name)
         if name != "House" and getattr(self, "house_watch", None):
             self.house_watch_stop()  # only follow the headset while the house map is on screen
         self.stack.set_visible_child_name(name)
-        nav_name = {"RoomPreview": "Rooms", "Ceiling": "Rooms", "WifiMap": "Signal", "House": "Signal"}.get(name, name)
+        nav_name = {"RoomPreview": "Rooms", "Ceiling": "Rooms", "WifiMap": "Signal", "House": "Signal",
+                    "Debug": "System"}.get(name, name)
         for n, b in self.nav.items():
             ctx = b.get_style_context()
             (ctx.add_class if n == nav_name else ctx.remove_class)("active")
@@ -986,7 +1110,7 @@ class FrameSettings(Gtk.Window):
                             None if self.upd_checked else self.on_update_check()),
          "Reminders": self.refresh_reminders, "Signal": self.refresh_signal,
          "WifiMap": lambda: self.refresh_wifi(full=True), "House": lambda: self.refresh_house(full=True),
-         "Ceiling": self.refresh_ceiling_status,
+         "Ceiling": self.refresh_ceiling_status, "Debug": self.refresh_debug,
          }.get(name, lambda: None)()
 
     def page(self, title):
@@ -1141,7 +1265,15 @@ class FrameSettings(Gtk.Window):
         if page == "Fan":
             self.temps_lbl.set_text("   ·   ".join(parts))
         self.rail_status.set_text(bat + (f"\nFan {s['rpm']:,} rpm" if s["rpm"] is not None else ""))
+        faults = debuglog.status().get("faults", 0)
+        if faults:  # the camera processor is stuck: only a reboot clears it
+            self.rail_cam.set_text(f"Camera stuck ({faults} faults): reboot the Frame (System › Debug log)")
+            self.rail_cam.show()
+        else:
+            self.rail_cam.hide()
         # live signal readings, only while their page is open
+        if page == "Debug":
+            self.refresh_debug()
         if page == "WifiMap" and not (self.wifi_rec and self.wifi_rec.running):
             self.refresh_wifi()
         elif page == "House" and not (self.house_rec and self.house_rec.running):
@@ -3443,7 +3575,7 @@ class FrameSettings(Gtk.Window):
                                           "this app; VR comes back in a few seconds.")
         restart.pack_start(ConfirmButton("Restart SteamVR", "Tap again to restart", self.do_restart_steamvr,
                                          css="primary"), False, False, 0)
-        box.pack_start(self.two_columns(info, restart), False, False, 0)
+        box.pack_start(self.two_columns(info, self.build_debug_card()), False, False, 0)
 
         upd = card("Update app", "Gets the newest Deckhand from GitHub. Your settings, rooms, maps and "
                                  "timers stay as they are.")
@@ -3496,7 +3628,8 @@ class FrameSettings(Gtk.Window):
         rrow.pack_start(cancel, False, False, 0)
         self.rm_box.pack_start(rrow, False, False, 0)
         rm.pack_start(self.rm_box, False, False, 0)
-        box.pack_start(self.two_columns(upd, rm), False, False, 0)
+        box.pack_start(self.two_columns(restart, upd), False, False, 0)
+        box.pack_start(rm, False, False, 0)
         # The install command gets a whole row: it's big and must stay on one line (half a row made
         # the window wider than the screen).
         box.pack_start(share, False, False, 0)
@@ -3572,7 +3705,8 @@ class FrameSettings(Gtk.Window):
         lines = [
             "<b>Warning: this removes everything Deckhand installed on this Frame.</b>",
             "• The app, its Steam library entry and its app-menu entry",
-            "• Its background jobs: auto shut-off, sleep timer, ceiling indicator, reminders, kitchen timer",
+            "• Its background jobs: auto shut-off, sleep timer, ceiling indicator, reminders, kitchen timer, "
+            "the debug log's camera watch (the debug log itself is kept as ~/deckhand-debug-&lt;date&gt;.log)",
             "• The fan helper and its password-free rule, if you ran setup: the fan goes back to stock",
             "• Screenshots are turned back on (if you blocked them here)",
             ("• <b>Kept:</b> your saved rooms, Wi-Fi and house maps and reminders" if keep else
@@ -3639,8 +3773,179 @@ class FrameSettings(Gtk.Window):
         cam = self.colour_camera()
         if cam is not None:
             lines.append("Colour passthrough camera: " + ("connected" if cam else
-                         "NOT DETECTED: take it off, reattach it firmly, then restart SteamVR"))
+                         "NOT DETECTED: take it off, reattach it firmly, then reboot the Frame"))
         self.sys_lbl.set_text("\n".join(lines))
+        self.refresh_debug_card()
+
+    # ============================================================ debug log
+    def build_debug_card(self):
+        c = card("Debug log", "One timeline of everything Deckhand does (taps, pages, the programs it runs, "
+                              "messages) and what the cameras and SteamVR do (faults, resets, crashes, headset "
+                              "on and off, temperatures).")
+        self.dbg_switch = Gtk.Switch(active=debuglog.enabled())
+        self.dbg_switch.connect("notify::active", self.on_debug_switch)
+        c.pack_start(switch_row("Record", label("Also while Deckhand is closed: a small background job that "
+                                                "only reads the system logs.", "desc", wrap=True), self.dbg_switch),
+                     False, False, 0)
+        self.dbg_card_lbl = label("", "status", wrap=True)
+        c.pack_start(self.dbg_card_lbl, False, False, 0)
+        b = add_class(Gtk.Button(label="Open debug log ›"), "primary")
+        b.connect("clicked", lambda *_: self.show_page("Debug"))
+        c.pack_start(b, False, False, 0)
+        return c
+
+    def camera_summary(self):
+        """(headline, details, stuck?) about the cameras since the Frame started (camera watch)."""
+        st = debuglog.status()
+        if not st:
+            if debuglog.enabled():
+                return "Camera watch is starting…", "", False
+            return "Camera watch is off.", "Turn on Record to follow the cameras.", False
+        f, r, c, w = (int(st.get(k) or 0) for k in ("faults", "recoveries", "crashes", "wakes"))
+        if f:
+            head = f"Camera stuck: {f} camera processor faults since the Frame started. Reboot the Frame to clear it."
+        elif r:
+            head = (f"Cameras working. The camera processor needed {r} reset{'s' if r != 1 else ''} since the "
+                    "Frame started (SteamVR recovered each time).")
+        else:
+            head = "Cameras: no faults or resets since the Frame started."
+        details = [f"put on {w} time{'s' if w != 1 else ''}", f"{c} program crash{'es' if c != 1 else ''}"]
+        if st.get("last_fault"):
+            details.append("last fault " + time.strftime("%H:%M:%S", time.localtime(st["last_fault"])))
+        return head, " · ".join(details), bool(f)
+
+    def refresh_debug_card(self):
+        head, _details, stuck = self.camera_summary()
+        self.dbg_card_lbl.set_text(head)
+        (self.dbg_card_lbl.get_style_context().add_class if stuck else
+         self.dbg_card_lbl.get_style_context().remove_class)("warn")
+
+    def build_debug_page(self):
+        """The debug log (no menu entry: opened from System)."""
+        box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14), "page")
+        head = Gtk.Box(spacing=18)
+        back = Gtk.Button(label="‹ Back to System")
+        back.connect("clicked", lambda *_: self.show_page("System"))
+        head.pack_start(back, False, False, 0)
+        head.pack_start(label("Debug log", "page-title"), False, False, 0)
+        box.pack_start(head, False, False, 0)
+        self.dbg_head = label("", "card-title", wrap=True)
+        box.pack_start(self.dbg_head, False, False, 0)
+        row = Gtk.Box(spacing=18)
+        self.dbg_detail = label("", "status", wrap=True)
+        row.pack_start(self.dbg_detail, True, True, 0)
+        self.dbg_reboot = ConfirmButton("Reboot the Frame", "Tap again to reboot", self.reboot_frame, css="primary")
+        self.dbg_reboot.set_no_show_all(True)  # shown while the camera is stuck
+        row.pack_end(self.dbg_reboot, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        self.dbg_filter = Segmented([("all", "Everything"), ("camera", "Cameras & SteamVR"), ("app", "Deckhand")],
+                                    lambda _v: self.refresh_debug(force=True))
+        self.dbg_filter.set_value("all")
+        box.pack_start(self.dbg_filter, False, False, 0)
+        self.dbg_view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
+                                     wrap_mode=Gtk.WrapMode.WORD_CHAR, left_margin=12, right_margin=12,
+                                     top_margin=8, bottom_margin=8)
+        add_class(self.dbg_view, "debug-view")
+        self.dbg_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.dbg_scroll.set_size_request(-1, 540)
+        self.dbg_scroll.add(self.dbg_view)
+        box.pack_start(self.dbg_scroll, False, False, 0)
+        acts = Gtk.Box(spacing=10, homogeneous=True)
+        for text, fn in (("Copy report", self.on_debug_copy), ("Save report", self.on_debug_save)):
+            b = add_class(Gtk.Button(label=text), "primary")
+            b.connect("clicked", fn)
+            acts.pack_start(b, True, True, 0)
+        acts.pack_start(ConfirmButton("Clear log", "Tap again to clear", self.on_debug_clear), True, True, 0)
+        box.pack_start(acts, False, False, 0)
+        self.dbg_result = label("Newest at the bottom. Times are the Frame's clock.", "desc", wrap=True)
+        box.pack_start(self.dbg_result, False, False, 0)
+        self._dbg_shown = None
+        return box
+
+    def refresh_debug(self, force=False):
+        head, details, stuck = self.camera_summary()
+        self.dbg_head.set_text(head)
+        (self.dbg_head.get_style_context().add_class if stuck else
+         self.dbg_head.get_style_context().remove_class)("warn")
+        self.dbg_detail.set_text(details + (" · recording" if debuglog.enabled() else " · not recording"))
+        self.dbg_reboot.set_no_show_all(not stuck)
+        self.dbg_reboot.show() if stuck else self.dbg_reboot.hide()
+        lines = debuglog.tail(400)
+        which = self.dbg_filter.value
+        if which == "app":
+            lines = [ln for ln in lines if ln[25:33].strip() == "app"]
+        elif which == "camera":
+            lines = [ln for ln in lines if ln[25:33].strip() != "app"]
+        text = "\n".join(ln[11:] for ln in lines) or "Nothing recorded yet."
+        if force or text != self._dbg_shown:
+            self._dbg_shown = text
+            self.dbg_view.get_buffer().set_text(text)
+            GLib.idle_add(self._debug_scroll_end)
+
+    def _debug_scroll_end(self):
+        adj = self.dbg_scroll.get_vadjustment()
+        adj.set_value(adj.get_upper() - adj.get_page_size())
+        return False
+
+    def debug_report(self):
+        return debuglog.report(header=[f"Deckhand {updater.local_version()} in {ROOT}",
+                                       f"Fan: {self.mode_lbl.get_text()}"])
+
+    def on_debug_copy(self, *_):
+        text = self.debug_report()
+        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clip.set_text(text, -1)
+        clip.store()
+        set_result(self.dbg_result, f"Copied the report ({len(text.splitlines())} lines) to the clipboard.", True)
+
+    def on_debug_save(self, *_):
+        folder = os.path.expanduser("~/Documents/Deckhand")
+        path = os.path.join(folder, time.strftime("deckhand-debug-%Y%m%d-%H%M%S.txt"))
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.debug_report())
+        except OSError as e:
+            set_result(self.dbg_result, f"Couldn't save the report: {e}", False)
+            return
+        set_result(self.dbg_result, f"Saved the report: {path.replace(os.path.expanduser('~'), '~')}", True)
+
+    def on_debug_clear(self):
+        debuglog.clear()
+        debuglog.log("app", "clear", "debug log cleared")
+        self.refresh_debug(force=True)
+
+    def on_debug_switch(self, sw, _pspec):
+        on = sw.get_active()
+        debuglog.set_enabled(on)
+        debuglog.log("app", "debug-log", "recording on" if on else "recording off", force=True)
+
+        def done(result):
+            ok, msg = result if isinstance(result, tuple) else (False, str(result))
+            if not ok:
+                set_result(self.dbg_card_lbl, f"Camera watch: {msg}", False)
+            else:
+                self.refresh_debug_card()
+        self.jobs.put(camwatch.ensure_service, done)
+
+    def reboot_frame(self):
+        """A full restart of the Frame: the only thing that clears a stuck camera processor."""
+        debuglog.log("app", "reboot", "rebooting the Frame (camera stuck)")
+        set_result(self.dbg_result, "Rebooting the Frame…", True)
+
+        def work():
+            try:
+                steam_shortcut.evaluate("SteamClient.System.RestartPC(), 'ok'")  # the way Steam itself does it
+                return True
+            except BaseException as e:  # noqa: BLE001 (SystemExit when Steam can't be reached)
+                debuglog.log("app", "reboot", f"Steam didn't take it ({e}); asking systemd")
+            return subprocess.run(["systemctl", "reboot"], capture_output=True, text=True, timeout=30).returncode == 0
+
+        def done(ok):
+            if ok is not True:
+                set_result(self.dbg_result, "Couldn't reboot from here: hold the power button and pick Restart.",
+                           False)
+        in_background(work, done)
 
     def do_restart_steamvr(self):
         # --no-block: systemd does the restart by itself; this returns at once (this window closes too)
@@ -3667,7 +3972,8 @@ def snapshot(prefix):
         ("WifiMap", win.show_wifi_page),
         ("House", win.show_house_page),
         ("House-dongle", lambda: (win.house_target_seg.set_value("dongle"), win.on_house_target("dongle"))),
-        ("Ceiling", win.show_ceiling_page)]
+        ("Ceiling", win.show_ceiling_page),
+        ("Debug", lambda: win.show_page("Debug"))]
     if win.house_m and win.house_m.get("samples"):  # the mini-map, as it would look in the middle of a walk
         smp = win.house_m["samples"][len(win.house_m["samples"]) // 2]
         loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
@@ -3694,6 +4000,13 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--snapshot":
         snapshot(sys.argv[2])
         return
+    debuglog.log("app", "start", f"Deckhand {updater.local_version()} (pid {os.getpid()}) from {ROOT}")
+    log_commands()
+
+    def excepthook(kind, value, tb):
+        debuglog.log("app", "crash", "".join(traceback.format_exception(kind, value, tb))[-900:])
+        sys.__excepthook__(kind, value, tb)
+    sys.excepthook = excepthook
     win = FrameSettings()
     win.show_all()
     win.show_setup(not win.setup_ready)

@@ -37,7 +37,8 @@ OBSOLETE = ["frame_settings.py", "ceiling.py", "house_map.py", "kitchen_timer.py
 OLD_LOGS = ["setup.log", "last-run.log", "power.log", "power.log.old"]
 SCRIPTS = ["launch.sh", "install.sh", "uninstall.sh", "setup.sh", "helpers/build.sh", "helpers/fanmode.sh",
            "app/deckhand.py"]
-SERVICES = ["frame-autooff.service", "frame-ceiling.service"]  # always-on jobs that run this folder's code
+# always-on jobs that run this folder's code
+SERVICES = ["frame-autooff.service", "frame-ceiling.service", "frame-camwatch.service"]
 BUILD_TIMEOUT = 900  # the helpers build at the lowest priority; this only catches a hang
 UA = {"User-Agent": "deckhand-updater"}
 
@@ -229,6 +230,17 @@ def migrate_units():
             changed.append(os.path.basename(unit_path))
         except Exception as e:  # noqa: BLE001 (the other units still get their turn)
             print(f"{os.path.basename(unit_path)}: {e}", file=sys.stderr)
+
+    try:  # the debug log's camera watch: created on install, follows this copy, off when switched off
+        import camwatch
+        before = os.path.isfile(camwatch.UNIT_PATH) and open(camwatch.UNIT_PATH, encoding="utf-8").read()
+        ok, msg = camwatch.ensure_service()
+        if not ok:
+            print(f"{camwatch.UNIT}: {msg}", file=sys.stderr)
+        elif before != (os.path.isfile(camwatch.UNIT_PATH) and open(camwatch.UNIT_PATH, encoding="utf-8").read()):
+            changed.append(camwatch.UNIT)
+    except Exception as e:  # noqa: BLE001 (the other units still get their turn)
+        print(f"camera watch: {e}", file=sys.stderr)
 
     unit_dir = os.path.expanduser("~/.config/systemd/user")
     tool, script = paths.tool("timer_overlay"), os.path.join(HERE, "reminders.py")
