@@ -2576,6 +2576,29 @@ class FrameSettings(Gtk.Window):
         share.pack_start(cmd, False, False, 0)
         share.pack_start(label(f"github.com/{updater.REPO}", "desc", selectable=True), False, False, 0)
         box.pack_start(self.two_columns(upd, share), False, False, 0)
+
+        rm = card("Remove Deckhand", "Uninstalls the app and everything it installed on this Frame.")
+        self.rm_open = Gtk.Button(label="Remove Deckhand…")
+        self.rm_open.connect("clicked", lambda *_: (self.rm_box.set_no_show_all(False), self.rm_box.show_all(),
+                                                    self.rm_open.hide(), self.refresh_remove_warning()))
+        rm.pack_start(self.rm_open, False, False, 0)
+        self.rm_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        self.rm_box.set_no_show_all(True)
+        self.rm_warn = label("", "status", wrap=True, markup=True)
+        self.rm_box.pack_start(self.rm_warn, False, False, 0)
+        self.rm_keep = Gtk.Switch(active=False)
+        self.rm_keep.connect("notify::active", lambda *_: self.refresh_remove_warning())
+        self.rm_box.pack_start(switch_row("Keep my data", label("Keep my saved rooms, maps, reminders and 3D models",
+                                                                "desc", wrap=True), self.rm_keep), False, False, 0)
+        rrow = Gtk.Box(spacing=10, homogeneous=True)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: (self.rm_box.hide(), self.rm_open.show()))
+        rrow.pack_start(cancel, True, True, 0)
+        rrow.pack_start(ConfirmButton("Remove everything", "Tap again: removes Deckhand", self.do_remove_all),
+                        True, True, 0)
+        self.rm_box.pack_start(rrow, False, False, 0)
+        rm.pack_start(self.rm_box, False, False, 0)
+        box.pack_start(rm, False, False, 0)
         box.pack_start(label(f"Deckhand lives in {HERE}", "desc", wrap=True), False, False, 0)
         return box
 
@@ -2617,6 +2640,45 @@ class FrameSettings(Gtk.Window):
             set_result(self.upd_lbl, f"Updated to version {res}. Restarting the app…", True)
             GLib.timeout_add(1500, self.restart_self)
         in_background(lambda: updater.install(log=lambda _m: None), done)
+
+    def refresh_remove_warning(self):
+        keep = self.rm_keep.get_active()
+        old_helper = 0 < helper_version() < 4
+        lines = [
+            "<b>Warning: this removes everything Deckhand installed on this Frame.</b>",
+            "• The app, its Steam library entry and its app-menu entry",
+            "• Its background jobs: auto shut-off, sleep timer, ceiling indicator, reminders, kitchen timer",
+            "• The fan helper and its password-free rule, if you ran setup: the fan goes back to stock",
+            "• Screenshots are turned back on (if you blocked them here)",
+            ("• <b>Kept:</b> your saved rooms, Wi-Fi and house maps, reminders and exported 3D models" if keep else
+             "• <b>Also deleted:</b> your saved rooms, Wi-Fi and house maps, reminders and exported 3D models "
+             "(~/Documents/Deckhand). This can't be undone."),
+            "Not touched: SteamVR, its other settings, and the room/boundary SteamVR is using now.",
+        ]
+        if old_helper:
+            lines.append("Your fan helper is from an older setup: afterwards, two small system files need your "
+                         "password to remove. Run in Konsole: <tt>sudo rm -f /etc/sudoers.d/zz-frame-settings "
+                         "&amp;&amp; sudo rm -rf /etc/frame-settings</tt>")
+        self.rm_warn.set_markup("\n".join(lines))
+
+    def do_remove_all(self):
+        """Runs uninstall.sh as its own job (it outlives this window), then closes the app."""
+        if getattr(self, "wifi_rec", None):
+            self.stop_wifi_mapping()
+        if getattr(self, "house_rec", None):
+            self.stop_house_walk()
+        if not vr_get("userinterface", "screenshots", "bool", True):
+            vr_set("userinterface", "screenshots", "bool", True)
+        args = ["systemd-run", "--user", "--quiet", "--collect", "--unit=deckhand-uninstall",
+                "/bin/bash", os.path.join(HERE, "uninstall.sh")]
+        if self.rm_keep.get_active():
+            args.append("--keep-data")
+        r = subprocess.run(args, capture_output=True, text=True)
+        if r.returncode != 0:
+            set_result(self.rm_warn, f"Couldn't start the removal: {(r.stderr or r.stdout).strip()}", False)
+            return
+        set_result(self.rm_warn, "Removing Deckhand… this window closes now. Goodbye!", True)
+        GLib.timeout_add(1200, lambda: (Gtk.main_quit(), False)[1])
 
     def restart_self(self):
         """Starts the new version in place of this one (same process, so Steam still counts it as running)."""

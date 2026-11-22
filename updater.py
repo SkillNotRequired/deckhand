@@ -99,7 +99,7 @@ def install(log=print):
                 tmpd = d + ".new"
                 shutil.copy2(s, tmpd)
                 os.replace(tmpd, d)  # a running program keeps its old file
-        for script in ("build.sh", "setup.sh", "fanmode.sh", "launch.sh", "install.sh", "frame_settings.py"):
+        for script in ("build.sh", "setup.sh", "fanmode.sh", "launch.sh", "install.sh", "uninstall.sh", "frame_settings.py"):
             p = os.path.join(HERE, script)
             if os.path.exists(p):
                 os.chmod(p, 0o755)

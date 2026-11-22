@@ -11,11 +11,13 @@
 #
 #   fanmode on <floor> [charging_floor] [strength%]   floors 0-55, strength 50-100
 #   fanmode off                                       stock fan control
+#   fanmode uninstall                                 stock fan, then removes this helper
+#                                                     and its sudo rule (Remove all)
 #   fanmode poweroff                                  shut the Frame down (fallback
 #                                                     when Steam's own shutdown fails)
 #   fanmode check                                     prints "ok <version>"
 set -eu
-VERSION=3
+VERSION=4
 
 SRC=/usr/share/deckard-fan-control
 DST=/etc/deckard-fan-control-quiet
@@ -74,15 +76,20 @@ case "${1:-}" in
     fi
     echo "fan minimum $FLOOR (charging $CHG), strength $SCALE%"
     ;;
-  off)
+  off|uninstall)
     rm -f "$DROPIN"
     rmdir "$DROPIN_DIR" 2>/dev/null || true
     rm -rf "$DST"
     restart_checked || { echo "stock fan service did not come back up" >&2; exit 4; }
     echo "stock fan control"
+    if [ "$1" = uninstall ]; then  # Deckhand's "Remove all": also this helper and its sudo rule
+      rm -f /etc/sudoers.d/zz-frame-settings /etc/sudoers.d/frame-settings
+      rm -rf /etc/frame-settings
+      echo "fan helper and its sudo rule removed"
+    fi
     ;;
   *)
-    sed -n '2,17p' "$0" >&2
+    sed -n '2,19p' "$0" >&2
     exit 2
     ;;
 esac

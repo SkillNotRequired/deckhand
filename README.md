@@ -46,11 +46,9 @@ System tab > **Update app**. Or run the install command again. Your settings, ro
 
 ## Remove
 
-```bash
-sudo ~/Deckhand/setup.sh remove      # only if you ran setup
-python3 ~/Deckhand/steam_shortcut.py remove
-rm -rf ~/Deckhand
-```
+System tab > **Remove Deckhand**. It warns you first, then removes the app, its Steam and app-menu
+entries, its background jobs and the fan helper (fan back to stock); tick the box to keep your saved
+rooms and maps. From Konsole: `~/Deckhand/uninstall.sh` (or `--keep-data`).
 
 ## Notes
 
