@@ -8,12 +8,14 @@ never touched. The native helpers are rebuilt afterwards (build.sh).
     python3 updater.py check     only check
 """
 import io
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,10 +39,30 @@ def _key(v):
     return tuple(int(p) if p.isdigit() else 0 for p in v.strip().split("."))
 
 
+_latest_sha = None  # the commit the last check() found; install() downloads exactly that one
+
+
+def _get(url, accept=None, timeout=10):
+    headers = dict(UA, **({"Accept": accept} if accept else {}))
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
+        return r.read()
+
+
 def latest_version(timeout=10):
-    req = urllib.request.Request(VERSION_URL, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode().strip()
+    """Newest version on GitHub. Asks the API for the latest commit (no caching delay right after a
+    release); falls back to the raw file (cached by GitHub for up to ~5 minutes)."""
+    global _latest_sha
+    try:
+        commit = json.loads(_get(f"https://api.github.com/repos/{REPO}/commits/{BRANCH}",
+                                 "application/vnd.github+json", timeout))
+        sha = commit["sha"]
+        version = _get(f"https://api.github.com/repos/{REPO}/contents/VERSION?ref={sha}",
+                       "application/vnd.github.raw", timeout).decode().strip()
+        _latest_sha = sha
+        return version
+    except (OSError, ValueError, KeyError):
+        _latest_sha = None
+        return _get(f"{VERSION_URL}?t={int(time.time())}", timeout=timeout).decode().strip()
 
 
 def check():
@@ -50,9 +72,11 @@ def check():
 
 
 def install(log=print):
-    """Downloads the main branch, copies it over this folder, rebuilds the helpers.
-    Returns the new version. Raises on any failure before files are replaced."""
-    req = urllib.request.Request(TARBALL_URL, headers=UA)
+    """Downloads the newest version (the commit check() found, else the main branch), copies it over
+    this folder, rebuilds the helpers. Returns the new version. Raises on any failure before files
+    are replaced."""
+    url = f"https://codeload.github.com/{REPO}/tar.gz/{_latest_sha}" if _latest_sha else TARBALL_URL
+    req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=60) as r:
         blob = r.read()
     log(f"downloaded {len(blob) // 1024} KB")
