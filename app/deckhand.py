@@ -785,7 +785,10 @@ class FrameSettings(Gtk.Window):
         rail.set_size_request(330, -1)
         head = Gtk.Box(spacing=14, margin_bottom=18)
         head.pack_start(icon_image(paths.ICON, 64), False, False, 0)
-        head.pack_start(label("Deckhand", "app-title"), False, False, 0)
+        title = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
+        title.pack_start(label("Deckhand", "app-title"), False, False, 0)
+        title.pack_start(label(f"version {updater.local_version()}", "rail-status"), False, False, 0)
+        head.pack_start(title, False, False, 0)
         rail.pack_start(head, False, False, 0)
         self.nav = {}
         for name, icon in self.PAGES:
