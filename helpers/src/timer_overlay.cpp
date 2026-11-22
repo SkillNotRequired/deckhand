@@ -1,306 +1,305 @@
-// timer_overlay: the in-headset part of Deckhand' kitchen timer and reminders.
+// timer_overlay: the in-headset part of Deckhand's kitchen timer and reminders.
 //
 //   timer_overlay <end_epoch_seconds> <image_dir> [popup_seconds]
-//   timer_overlay --selftest <file.rgba>     (loads an image into a hidden overlay)
+//   timer_overlay --live <file.rgba> [parent_pid]
+//   timer_overlay --minimap <file.rgba> [parent_pid]
 //
-// Sleeps until `popup_seconds` (default 60; 0 for reminders) before the end,
-// then shows a countdown pinned to the top-centre of your view (a SteamVR
-// overlay locked to the headset) from <image_dir>/NN.rgba (NN = seconds left).
-// At zero it shows <image_dir>/done.rgba, plays the alarm a few times and keeps
-// it up for 30 s. SIGTERM (Cancel in the app) hides the overlay and exits.
+// Countdown: sleeps until `popup_seconds` (default 60) before the end, then shows a countdown
+// pinned to the top-centre of your view (a SteamVR overlay locked to the headset) from
+// <image_dir>/NN.rgba (NN = seconds left). At zero it sounds the alarm, shows <image_dir>/done.rgba
+// for 30 s and rings twice more. Reminders use popup_seconds 0: only done.rgba and the alarm, at the
+// due time. If SteamVR isn't up then (a reminder missed while the Frame was off fires right after it
+// boots), a reminder waits up to 15 minutes for SteamVR so it is seen and not just heard, and rings
+// without it after that. SIGTERM (Cancel in the app) hides the popup and exits.
 //
-// Images are raw RGBA (8-byte header: uint32 width, uint32 height, little
-// endian) uploaded with SetOverlayRaw: the picture is swapped in place, with no
-// decoding and no blank frame between seconds (SetOverlayFromFile flickered and
-// dropped seconds).
+// --live: shows <file> a little above the centre of your view and re-uploads it whenever it is
+// replaced (Deckhand's Wi-Fi readout); --minimap: the same as a see-through panel in the middle of
+// the view (the house walk's mini-map). Both run until SIGTERM, or until process <parent_pid>
+// (Deckhand) has gone.
 //
-// Light on battery: while waiting it sleeps in long chunks (signals still wake
-// it), and it only connects to SteamVR for the popup itself. It never starts
-// SteamVR (VR_Init would otherwise launch a display-less SteamVR); without
-// SteamVR the alarm still sounds.
-#include <openvr.h>
+// Pictures are raw RGBA (see load_rgba in common.h) uploaded with SetOverlayRaw: the picture is
+// swapped in place, with no decoding and no blank frame between seconds (SetOverlayFromFile
+// flickered and dropped seconds). Each process uses its own overlay key, so two timers or
+// reminders can be up at once.
+//
+// Light on battery: while waiting it sleeps in long chunks (signals still wake it), and it only
+// connects to SteamVR for the popup itself, through the safe connect gate (common.h): it never
+// starts SteamVR. Without SteamVR the alarm still sounds.
+#include "common.h"
 
-#include <csignal>
-#include <cstdint>
+#include <algorithm>
+#include <climits>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <dirent.h>
+#include <spawn.h>
 #include <string>
 #include <sys/stat.h>
-#include <unistd.h>
+#include <sys/wait.h>
 #include <vector>
 
-static volatile sig_atomic_t g_quit = 0;
-static void on_signal(int) { g_quit = 1; }
+extern char **environ;
 
-static bool vrserver_running() {
-    DIR *d = opendir("/proc");
-    if (!d) return false;
-    bool found = false;
-    while (dirent *e = readdir(d)) {
-        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-        FILE *f = fopen((std::string("/proc/") + e->d_name + "/comm").c_str(), "r");
-        if (!f) continue;
-        char comm[64] = {0};
-        found = fgets(comm, sizeof comm, f) && strcmp(comm, "vrserver\n") == 0;
-        fclose(f);
-        if (found) break;
-    }
-    closedir(d);
-    return found;
-}
+// Head-locked placement: a panel kAhead metres in front of the eyes, raised by up_tan * kAhead.
+constexpr float kAhead = 1.1f;
+constexpr float kTimerUpTan = 0.2493f;  // tan(14 deg): timers and reminders, high in the view
+constexpr float kLiveUpTan = 0.0875f;   // tan(5 deg): the live readout, under any timer popup
+constexpr float kPanelWidth = 0.42f;    // metres (about 22 degrees)
+constexpr float kMinimapWidth = 0.32f;  // the mini-map sits right in the middle (it's see-through)
+constexpr double kDoneSec = 30;               // "done" stays up this long
+constexpr double kReminderWaitSec = 15 * 60;  // a due reminder waits this long for SteamVR
 
-static double now() {
-    timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9;
-}
+// ------------------------------------------------------------------ alarm ---
+// paplay processes still playing: reaped as they finish, never waited for.
+static std::vector<pid_t> g_players;
 
-static bool exists(const std::string &p) {
-    struct stat st;
-    return stat(p.c_str(), &st) == 0;
-}
-
+// Starts the alarm sound and returns at once (a stuck sound server must not hold up the popup).
 static void play_alarm() {
-    const char *sounds[] = {"/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
-                            "/usr/share/sounds/ocean/stereo/alarm-clock-elapsed.oga",
-                            "/usr/share/sounds/freedesktop/stereo/complete.oga"};
-    for (const char *s : sounds)
-        if (exists(s)) {
-            std::string cmd = std::string("paplay '") + s + "' >/dev/null 2>&1 &";
-            if (std::system(cmd.c_str()) != 0) fprintf(stderr, "paplay failed\n");
-            return;
-        }
-}
-
-struct Image {
-    uint32_t w = 0, h = 0;
-    std::vector<uint8_t> px;
-};
-
-static bool load_rgba(const std::string &path, Image &im) {
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f) return false;
-    uint32_t hdr[2];
-    bool ok = fread(hdr, 4, 2, f) == 2 && hdr[0] > 0 && hdr[1] > 0 && hdr[0] <= 4096 && hdr[1] <= 4096;
-    if (ok) {
-        im.w = hdr[0];
-        im.h = hdr[1];
-        im.px.resize(size_t(im.w) * im.h * 4);
-        ok = fread(im.px.data(), 1, im.px.size(), f) == im.px.size();
+    static const char *const kSounds[] = {"/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+                                          "/usr/share/sounds/ocean/stereo/alarm-clock-elapsed.oga",
+                                          "/usr/share/sounds/freedesktop/stereo/complete.oga"};
+    for (const char *sound : kSounds) {
+        if (access(sound, R_OK) != 0) continue;
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+        sigset_t restore;  // we ignore SIGPIPE (helper_init); paplay gets the default back
+        sigemptyset(&restore);
+        sigaddset(&restore, SIGPIPE);
+        posix_spawnattr_setsigdefault(&attr, &restore);
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
+        posix_spawn_file_actions_t io;
+        posix_spawn_file_actions_init(&io);
+        posix_spawn_file_actions_addopen(&io, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+        char *const args[] = {const_cast<char *>("paplay"), const_cast<char *>(sound), nullptr};
+        pid_t pid = 0;
+        const int rc = posix_spawnp(&pid, "paplay", &io, &attr, args, environ);
+        if (rc == 0)
+            g_players.push_back(pid);
+        else
+            fprintf(stderr, "paplay: %s\n", strerror(rc));
+        posix_spawn_file_actions_destroy(&io);
+        posix_spawnattr_destroy(&attr);
+        return;
     }
-    fclose(f);
-    return ok;
+    fprintf(stderr, "no alarm sound found\n");
 }
 
-struct Overlay {
-    vr::IVROverlay *ov = nullptr;
+static void reap_players() {
+    g_players.erase(std::remove_if(g_players.begin(), g_players.end(),
+                                   [](pid_t pid) { return waitpid(pid, nullptr, WNOHANG) != 0; }),
+                    g_players.end());
+}
+
+// ------------------------------------------------------------------ popup ---
+// One head-locked overlay. It connects (through the gate) only when there is something to show.
+struct Popup {
+    OverlayConnection link;
+    std::string key;  // per process: a second timer or reminder must not fail with KeyInUse
+    float up_tan, width;
     vr::VROverlayHandle_t h = vr::k_ulOverlayHandleInvalid;
     bool shown = false;
-    const char *key = "framesettings.timer";
-    float up_tan = 0.2493f;  // tan(14 deg): how far above the centre of the view
-    float right = 0.0f;      // metres right of centre (negative = left)
-    float width = 0.42f;     // metres
-    bool face_eye = false;   // turn the panel to face the eye (for off-centre panels)
 
+    Popup(const char *key_prefix, float up_tangent, float width_m)
+        : key(key_prefix + std::to_string(getpid())), up_tan(up_tangent), width(width_m) {}
+
+    bool is_open() const { return h != vr::k_ulOverlayHandleInvalid; }
+
+    // Connects and creates the overlay (still hidden). False while the gate is closed or it failed.
     bool open() {
-        if (ov) return true;
-        if (!vrserver_running()) return false;
-        vr::EVRInitError err = vr::VRInitError_None;
-        vr::VR_Init(&err, vr::VRApplication_Overlay);
-        if (err != vr::VRInitError_None) {
-            fprintf(stderr, "SteamVR: %s\n", vr::VR_GetVRInitErrorAsEnglishDescription(err));
+        if (is_open()) return true;
+        if (!link.connect()) return false;
+        const vr::EVROverlayError e = link.ov->CreateOverlay(key.c_str(), "Deckhand", &h);
+        if (e != vr::VROverlayError_None) {
+            fprintf(stderr, "CreateOverlay %s: %s\n", key.c_str(), link.ov->GetOverlayErrorNameFromEnum(e));
+            h = vr::k_ulOverlayHandleInvalid;
+            link.close(&h, 1);  // nothing uploaded: just disconnects
+            link.next_try = mono_now() + kInitRetrySec;
             return false;
         }
-        ov = vr::VROverlay();
-        vr::EVROverlayError oe = ov->CreateOverlay(key, "Deckhand", &h);
-        if (oe != vr::VROverlayError_None) {
-            fprintf(stderr, "CreateOverlay: %s\n", ov->GetOverlayErrorNameFromEnum(oe));
-            close();
-            return false;
-        }
-        // 1.1 m ahead, up_tan up (14 degrees for timers), 0.42 m wide (about 22 degrees).
-        const float d = 1.1f, up = d * up_tan;
-        vr::HmdMatrix34_t m = {{{1, 0, 0, right}, {0, 1, 0, up}, {0, 0, 1, -d}}};
-        if (face_eye) {  // columns = the panel's x, y, z axes; z points back at the eye
-            float p[3] = {right, up, -d}, n = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
-            float z[3] = {-p[0] / n, -p[1] / n, -p[2] / n};
-            float x[3] = {z[2], 0, -z[0]};  // up x z
-            float xl = std::sqrt(x[0] * x[0] + x[2] * x[2]);
-            x[0] /= xl; x[2] /= xl;
-            float y[3] = {z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]};
-            for (int r = 0; r < 3; r++) {
-                m.m[r][0] = x[r];
-                m.m[r][1] = y[r];
-                m.m[r][2] = z[r];
-            }
-        }
-        ov->SetOverlayWidthInMeters(h, width);
-        ov->SetOverlayTransformTrackedDeviceRelative(h, vr::k_unTrackedDeviceIndex_Hmd, &m);
-        ov->SetOverlaySortOrder(h, 200);
-        ov->SetOverlayAlpha(h, 0.95f);
+        // Locked to the headset: kAhead in front, raised by up_tan, `width` wide, facing the eyes.
+        const vr::HmdMatrix34_t m = {{{1, 0, 0, 0}, {0, 1, 0, kAhead * up_tan}, {0, 0, 1, -kAhead}}};
+        link.ov->SetOverlayWidthInMeters(h, width);
+        link.ov->SetOverlayTransformTrackedDeviceRelative(h, vr::k_unTrackedDeviceIndex_Hmd, &m);
+        link.ov->SetOverlaySortOrder(h, 200);
+        link.ov->SetOverlayAlpha(h, 0.95f);
         shown = false;
         return true;
     }
 
-    void show(const std::string &path) {
-        Image im;
-        if (!load_rgba(path, im)) {
-            fprintf(stderr, "can't read %s\n", path.c_str());
-            return;
-        }
-        if (!ov && !open()) return;
-        vr::EVROverlayError oe = ov->SetOverlayRaw(h, im.px.data(), im.w, im.h, 4);
-        if (oe != vr::VROverlayError_None) fprintf(stderr, "SetOverlayRaw: %s\n", ov->GetOverlayErrorNameFromEnum(oe));
-        if (!shown) {  // show once, after the first picture is in: no empty frame
-            ov->ShowOverlay(h);
+    // Swaps in `im`; the popup is shown once, after its first picture is in (no empty frame).
+    bool show(Image &im) {
+        if (!open() || !link.upload(h, im)) return false;
+        if (!shown) {
+            link.ov->ShowOverlay(h);
             shown = true;
         }
+        return true;
     }
 
-    void poll() {  // SteamVR quitting: let go of it (and reconnect on the next show if it comes back)
-        if (!ov) return;
-        vr::VREvent_t ev;
-        while (vr::VRSystem() && vr::VRSystem()->PollNextEvent(&ev, sizeof ev))
-            if (ev.eventType == vr::VREvent_Quit) {
-                vr::VRSystem()->AcknowledgeQuit_Exiting();
-                close();
-                return;
-            }
-    }
-
-    void close() {
-        // Hide first and give the compositor time to finish with the last raw upload: destroying
-        // the overlay and disconnecting right after SetOverlayRaw crashed vrcompositor (SIGBUS).
-        if (ov && h != vr::k_ulOverlayHandleInvalid) {
-            ov->HideOverlay(h);
-            usleep(1000000);
-            ov->DestroyOverlay(h);
+    // SteamVR's events, and the liveness check. False when the popup isn't open (any more).
+    bool poll() {
+        if (!is_open()) return false;
+        if (link.server_died()) {
+            fprintf(stderr, "SteamVR went away without quitting\n");
+            link.drop(&h, 1);
+            shown = false;
+            return false;
         }
-        if (ov) vr::VR_Shutdown();
-        ov = nullptr;
-        h = vr::k_ulOverlayHandleInvalid;
+        vr::VREvent_t ev;
+        while (link.sys->PollNextEvent(&ev, sizeof ev))
+            if (ev.eventType == vr::VREvent_Quit) {  // close once, now, and keep away from this server
+                link.quit_received();
+                close();
+                return false;
+            }
+        return true;
+    }
+
+    // Hide, settle, destroy, disconnect (common.h).
+    void close() {
+        link.close(&h, 1);
         shown = false;
     }
 };
 
-// Loads an image into a hidden overlay: checks the SteamVR side without showing anything.
-static int selftest(const char *path) {
-    if (!vrserver_running()) {
-        printf("selftest: SteamVR not running\n");
-        return 1;
-    }
-    Image im;
-    if (!load_rgba(path, im)) {
-        printf("selftest: can't read %s\n", path);
-        return 1;
-    }
-    vr::EVRInitError err = vr::VRInitError_None;
-    vr::VR_Init(&err, vr::VRApplication_Overlay);
-    if (err != vr::VRInitError_None) {
-        printf("selftest: VR_Init: %s\n", vr::VR_GetVRInitErrorAsEnglishDescription(err));
-        return 1;
-    }
-    vr::IVROverlay *ov = vr::VROverlay();
-    vr::VROverlayHandle_t h;
-    vr::EVROverlayError oe = ov->CreateOverlay("framesettings.timer.selftest", "selftest", &h);
-    printf("selftest: CreateOverlay %s\n", ov->GetOverlayErrorNameFromEnum(oe));
-    int rc = oe == vr::VROverlayError_None ? 0 : 1;
-    if (rc == 0) {
-        for (int i = 0; i < 3 && rc == 0; i++) {  // a few uploads, like consecutive seconds
-            oe = ov->SetOverlayRaw(h, im.px.data(), im.w, im.h, 4);
-            printf("selftest: SetOverlayRaw %ux%u %s\n", im.w, im.h, ov->GetOverlayErrorNameFromEnum(oe));
-            rc = oe == vr::VROverlayError_None ? 0 : 1;
+// -------------------------------------------------------------- countdown ---
+static int countdown(double end, const std::string &dir, int popup) {
+    Popup p("framesettings.timer.", kTimerUpTan, kPanelWidth);
+    for (;;) {
+        // Sleep until the popup is due, in chunks: a signal ends it, and a changed clock is noticed.
+        while (!g_quit && wall_now() < end - popup) nap(std::min(30.0, end - popup - wall_now()));
+        if (g_quit || popup == 0) break;
+
+        // The last `popup` seconds: NN.rgba each second.
+        int last = -1;
+        bool clock_went_back = false;
+        while (!g_quit) {
+            const double left = end - wall_now();
+            if (left <= 0) break;
+            if (left > popup + 2) {  // the clock was set back: take the popup down and wait again
+                clock_went_back = true;
+                break;
+            }
+            const int secs = int(std::ceil(left));
+            p.poll();  // events first: never upload to a SteamVR that has just said it's quitting
+            if (secs != last && p.open()) {
+                char name[32];
+                snprintf(name, sizeof name, "/%02d.rgba", std::min(secs, 60));
+                Image im;
+                if (load_rgba(dir + name, im))
+                    p.show(im);
+                else
+                    fprintf(stderr, "can't read %s%s\n", dir.c_str(), name);
+                last = secs;
+            }
+            // Sleep to just past the next whole second, so every second is shown on time.
+            const double to_go = end - wall_now();
+            const double frac = to_go > 0 ? to_go - std::floor(to_go) : 0;
+            nap(std::max(frac, 0.02) + 0.005);
         }
-        printf("selftest: visible %d\n", int(ov->IsOverlayVisible(h)));
-        usleep(1500000);  // let the compositor finish with the uploads (see Overlay::close)
-        ov->DestroyOverlay(h);
-        usleep(500000);
+        if (!clock_went_back) break;
+        p.close();
     }
-    vr::VR_Shutdown();
-    return rc;
+    if (g_quit) {
+        p.close();
+        return 0;
+    }
+
+    // Time's up.
+    Image done;
+    const bool have_done = load_rgba(dir + "/done.rgba", done);
+    if (!have_done) fprintf(stderr, "can't read %s/done.rgba\n", dir.c_str());
+    if (popup == 0 && have_done && !p.link.gate_open()) {
+        // A reminder, and SteamVR isn't (settled and) up: e.g. the Frame just booted and a reminder
+        // it missed while off fired. Give SteamVR time, so the reminder is seen; then ring anyway.
+        fprintf(stderr, "waiting for SteamVR to show the reminder\n");
+        const double give_up = mono_now() + kReminderWaitSec;
+        while (nap(2) && mono_now() < give_up && !p.link.gate_open()) {
+        }
+        if (g_quit) return 0;
+    }
+    // The alarm first: the sound never waits on SteamVR. Then "done", retried (every ~2 s, through
+    // the gate) until SteamVR takes it, for the whole 30 s.
+    play_alarm();
+    const double t0 = mono_now();
+    int rings = 1;
+    bool done_up = false;  // done.rgba is on screen (the popup may still show the last second)
+    while (!g_quit && mono_now() - t0 < kDoneSec) {
+        if (rings < 3 && mono_now() - t0 >= 4.0 * rings - 0.05) {  // twice more: at 4 s and 8 s
+            play_alarm();
+            rings++;
+        }
+        if (!p.poll()) done_up = false;  // not open (any more): show it again if SteamVR comes back
+        if (have_done && !done_up) done_up = p.show(done);
+        reap_players();
+        nap(0.5);
+    }
+    p.close();
+    reap_players();
+    return 0;
 }
 
-// --live <file.rgba>: show <file> in the same top-centre spot and re-upload it whenever it
-// changes, until SIGTERM (Deckhand uses it for the Wi-Fi readout while mapping).
-// --minimap <file.rgba>: the same, as a see-through panel in the middle of the view (the house walk's mini-map).
-static int live(const char *path, bool minimap) {
-    signal(SIGTERM, on_signal);
-    signal(SIGINT, on_signal);
-    Overlay o;
-    o.key = "framesettings.live";
-    o.up_tan = 0.0875f;  // tan(5 deg): a little above centre, under any timer popup
-    if (minimap) {       // --minimap: in the middle of the view (it's see-through)
-        o.key = "framesettings.minimap";
-        o.up_tan = 0.0f;
-        o.right = 0.0f;
-        o.width = 0.32f;
+// -------------------------------------------------------- live / minimap ---
+static int live(const char *path, bool minimap, pid_t parent) {
+    Popup p(minimap ? "framesettings.minimap." : "framesettings.live.", minimap ? 0.0f : kLiveUpTan,
+            minimap ? kMinimapWidth : kPanelWidth);
+    Image im;              // the newest picture from `path`
+    bool pending = false;  // ... not on screen yet
+    ino_t seen_ino = 0;    // which version of the file `im` is (Deckhand replaces it, os.replace)
+    timespec seen_mtime{0, 0};
+    double next_parent_check = 0;
+    if (parent > 0 && !process_exists(parent)) {
+        // Deckhand passes its own PID right before starting us, so it can't have gone yet: it is in
+        // another PID namespace (a sandboxing launcher). Don't watch a number that means nothing here.
+        fprintf(stderr, "process %d isn't visible from here: not watching it\n", int(parent));
+        parent = 0;
     }
-    time_t last_mtime = 0;
-    long last_ns = -1;
     while (!g_quit) {
-        struct stat st;
-        if (stat(path, &st) == 0 && (st.st_mtime != last_mtime || st.st_mtim.tv_nsec != last_ns)) {
-            last_mtime = st.st_mtime;
-            last_ns = st.st_mtim.tv_nsec;
-            o.show(path);
+        // Deckhand gone (it crashed or was killed without stopping us): don't leave its picture in view.
+        const double now = mono_now();
+        if (parent > 0 && now >= next_parent_check) {
+            next_parent_check = now + 1;
+            if (!process_exists(parent)) {
+                fprintf(stderr, "process %d has gone: closing\n", int(parent));
+                break;
+            }
         }
-        o.poll();
-        usleep(200000);
+        // Events first (never upload to a SteamVR that is quitting). If SteamVR quit or died, the
+        // popup is gone: put the picture back once SteamVR is back.
+        if (!p.poll() && !im.px.empty()) pending = true;
+        struct stat st;
+        if (stat(path, &st) == 0 && (st.st_ino != seen_ino || st.st_mtim.tv_sec != seen_mtime.tv_sec ||
+                                     st.st_mtim.tv_nsec != seen_mtime.tv_nsec)) {
+            seen_ino = st.st_ino;
+            seen_mtime = st.st_mtim;
+            if (load_rgba(path, im)) pending = true;
+        }
+        if (pending && p.show(im)) pending = false;
+        nap(0.2);
     }
-    o.close();
+    p.close();
     return 0;
+}
+
+// ------------------------------------------------------------------- main ---
+static int usage(const char *me) {
+    fprintf(stderr,
+            "usage: %s <end_epoch> <image_dir> [popup_seconds]\n"
+            "       %s --live <file.rgba> [parent_pid]\n"
+            "       %s --minimap <file.rgba> [parent_pid]\n",
+            me, me, me);
+    return 2;
 }
 
 int main(int argc, char **argv) {
-    if (argc == 3 && strcmp(argv[1], "--selftest") == 0) return selftest(argv[2]);
-    if (argc == 3 && strcmp(argv[1], "--live") == 0) return live(argv[2], false);
-    if (argc == 3 && strcmp(argv[1], "--minimap") == 0) return live(argv[2], true);
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <end_epoch> <image_dir> [popup_seconds]\n", argv[0]);
-        return 2;
+    helper_init();
+    if (argc >= 2 && (strcmp(argv[1], "--live") == 0 || strcmp(argv[1], "--minimap") == 0)) {
+        long parent = 0;
+        if (argc < 3 || argc > 4 || (argc == 4 && !parse_long(argv[3], 1, INT_MAX, parent))) return usage(argv[0]);
+        return live(argv[2], strcmp(argv[1], "--minimap") == 0, pid_t(parent));
     }
-    const double end = atof(argv[1]);
-    const std::string dir = argv[2];
-    const int popup = argc > 3 ? atoi(argv[3]) : 60;
-    signal(SIGTERM, on_signal);
-    signal(SIGINT, on_signal);
-
-    // Wait in chunks of up to 30 s (a signal cuts the sleep short).
-    while (!g_quit && now() < end - popup) {
-        const double wait = end - popup - now();
-        usleep(useconds_t((wait > 30.0 ? 30.0 : (wait > 0 ? wait : 0)) * 1e6));
-    }
-    if (g_quit) return 0;
-
-    Overlay o;
-    int last = -1;
-    while (!g_quit) {
-        const double left = end - now();
-        if (left <= 0) break;
-        const int secs = int(left + 0.999);  // ceil: show 60..1
-        if (secs != last) {
-            char name[32];
-            snprintf(name, sizeof name, "%02d.rgba", secs > 60 ? 60 : secs);
-            o.show(dir + "/" + name);
-            last = secs;
-        }
-        o.poll();
-        // Sleep to just past the next whole second, so every second is shown on time.
-        const double frac = (end - now()) - double(int(end - now()));
-        usleep(useconds_t((frac > 0.02 ? frac : 0.02) * 1e6) + 5000);
-    }
-    if (!g_quit) {
-        o.show(dir + "/done.rgba");
-        for (int i = 0; i < 60 && !g_quit; i++) {  // 30 s up; alarm at 0, 4 and 8 s
-            if (i == 0 || i == 8 || i == 16) play_alarm();
-            o.poll();
-            usleep(500000);
-        }
-    }
-    o.close();
-    return 0;
+    double end = 0;
+    long popup = 60;
+    if (argc < 3 || argc > 4 || !parse_double(argv[1], end) || end <= 0 ||
+        (argc == 4 && !parse_long(argv[3], 0, 86400, popup)))
+        return usage(argv[0]);
+    return countdown(end, argv[2], int(popup));
 }

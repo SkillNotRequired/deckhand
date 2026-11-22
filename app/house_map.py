@@ -6,17 +6,20 @@ strength of BOTH links:
   home Wi-Fi    the Frame's link to your router (iw <station iface> link)
   Steam dongle  the PC dongle's link to the Frame's own 6 GHz access point
                 (iw <ap iface> station dump: how loudly the Frame hears the dongle)
+Every position is kept, measured or not, so dead zones still show as walked floor.
 
 Heights split floors. Results: a top-down map per floor (0.5 m squares coloured by the
 chosen signal, the edge of where you walked, your path, labels).
 Tracking can jump if the Frame re-recognises a room; a jump over 2 m starts a new
 path segment instead of drawing a line across the house.
+
+A walk in progress is saved every 30 s (walk-inprogress-<pid>.json); if Deckhand closes
+or crashes mid-walk, recover() adds it to the map the next time.
 """
 import html
 import json
 import math
 import os
-import subprocess
 import threading
 import time
 
@@ -26,62 +29,19 @@ HOUSE = os.path.expanduser("~/.local/share/frame-settings/wifi-house")
 CURRENT = os.path.join(HOUSE, "current.json")
 CELL = 0.5
 MAX_SECONDS = 3600
+AUTOSAVE_EVERY = 30  # seconds
 FLOOR_HEIGHT = 2.7   # metres between storeys (for splitting floors)
 EYE_HEIGHT = 1.6     # head above its floor, roughly
 LABELS = ["Router", "PC", "Bedroom", "Kitchen", "Living room", "Office", "Bathroom", "Garage", "Hall"]
 TARGETS = wifi_map.TARGETS
+KEEP_CLEARED = 3     # Clear map keeps this many earlier maps as backups
 
-# sample: [x, y, z, wifi_dbm, wifi_tx, segment, dongle_dbm, dongle_tx]
+# sample: [x, y, z, wifi_dbm, wifi_tx, segment, dongle_dbm, dongle_tx] (None = not measured)
 WIFI, WIFI_TX, SEG, DONGLE, DONGLE_TX = 3, 4, 5, 6, 7
-
 
 ap_interface = wifi_map.ap_interface
 dongle_signal = wifi_map.dongle_signal
-
-
-class PoseWatcher:
-    """Where the headset is right now (for the "You" marker while the map page is open):
-    space_tool track twice a second as a background SteamVR app; stop() ends it."""
-
-    def __init__(self, every_ms=500):
-        self.pose = None                    # latest headset (x, y, z) or None
-        self.heading = (0.0, -1.0)          # look direction on the floor (x, z)
-        self.every_ms = every_ms
-        self.proc = None
-        self.running = False
-
-    def start(self):
-        if not os.access(wifi_map.SPACE_TOOL, os.X_OK):
-            raise RuntimeError("space_tool is missing: run helpers/build.sh on the Frame")
-        self.proc = subprocess.Popen([wifi_map.SPACE_TOOL, "track", str(self.every_ms)],
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        self.running = True
-        threading.Thread(target=self._read_poses, daemon=True).start()
-        return self
-
-    def _read_poses(self):
-        proc = self.proc
-        for line in proc.stdout:
-            p = line.split()
-            if len(p) == 8 and p[0] == "p" and p[1] == "hmd":
-                pos = (float(p[3]), float(p[4]), float(p[5])) if p[2] == "1" else None
-                self.pose = pos
-                fx, fz = float(p[6]), float(p[7])
-                if pos and math.hypot(fx, fz) > 0.2:
-                    self.heading = (fx, fz)
-            if not self.running:
-                break
-
-    def stop(self):
-        self.running = False
-        if self.proc:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-            self.proc = None
-        return self
+PoseWatcher = wifi_map.PoseWatcher  # the "You" marker while the map page is open
 
 
 class HouseRecorder(PoseWatcher):
@@ -97,53 +57,176 @@ class HouseRecorder(PoseWatcher):
         self.segment = 0
         self.iface = self.ap = None
         self._last = None
+        self._sampler = None
+        self._save_lock = threading.Lock()
 
     def start(self, segment_offset=0):
+        """Looks up the radio interfaces (subprocesses): call it off the UI thread."""
         self.iface, self.ap = wifi_map.station_interface(), ap_interface()
         self.segment = segment_offset
+        self.samples, self.distance, self._last = [], 0.0, None
         super().start()
-        self.started = time.time()
-        threading.Thread(target=self._sample, daemon=True).start()
+        self.started = time.monotonic()
+        self._sampler = threading.Thread(target=self._sample, daemon=True)
+        self._sampler.start()
         return self
 
     def _sample(self):
+        saved_at = ap_checked = time.monotonic()
         while self.running:
-            if time.time() - self.started > MAX_SECONDS:
-                self.running = False
+            if self.elapsed() > MAX_SECONDS:
+                self.running = False  # the app sees this and finishes the walk
                 break
+            if not self.ap and time.monotonic() - ap_checked > 10:  # the dongle's link may come up later
+                ap_checked = time.monotonic()
+                self.ap = ap_interface()
             s = wifi_map.signal(self.iface)
             d = dongle_signal(self.ap) if self.ap else None
             self.latest, self.latest_dongle = s, d
+            s = s if s and s["dbm"] is not None else None
             pose = self.pose
-            if pose and ((s and s["dbm"] is not None) or d):
+            if pose:
                 if self._last:
-                    step = math.dist(pose, self._last)
-                    if step > 2.0:
+                    if math.dist(pose, self._last) > 2.0:
                         self.segment += 1  # tracking jumped: don't join it up
                     else:
-                        self.distance += step
+                        self.distance += math.hypot(pose[0] - self._last[0], pose[2] - self._last[2])
                 self._last = pose
                 self.samples.append([round(pose[0], 2), round(pose[1], 2), round(pose[2], 2),
                                      s["dbm"] if s else None, s["tx"] if s else None, self.segment,
                                      d["dbm"] if d else None, d["tx"] if d else None])
-            time.sleep(0.5)
+            if self.samples and time.monotonic() - saved_at > AUTOSAVE_EVERY:
+                saved_at = time.monotonic()
+                self.autosave()
+            self._wake.wait(0.5)
+
+    def autosave(self):
+        """Keeps the walk so far on disk (recover() adds it to the map if Deckhand doesn't finish it)."""
+        with self._save_lock:
+            if not self.running:  # stopped meanwhile: the finished walk is being saved instead
+                return
+            try:
+                write_json(inprogress_path(), {"samples": list(self.samples), "distance": round(self.distance, 1),
+                                               "ssid": (self.latest or {}).get("ssid", ""), "saved": time.time()})
+            except OSError:
+                pass
 
     def elapsed(self):
-        return time.time() - self.started if self.started else 0
+        return time.monotonic() - self.started if self.started else 0
+
+    def stop(self):
+        super().stop()
+        with self._save_lock:
+            pass  # an autosave already writing finishes first; later ones see running == False
+        if self._sampler and self._sampler is not threading.current_thread():
+            self._sampler.join(timeout=1)  # its last reading lands before the walk is added
+        return self
 
 
-def add_walk(m, rec):
-    """Adds a finished walk to the house map `m` (or starts one)."""
-    m = m or {"kind": "house", "samples": [], "labels": [], "distance": 0.0, "walks": 0}
-    m["samples"] += rec.samples
-    m["distance"] = round(m.get("distance", 0) + rec.distance, 1)
-    m["walks"] = m.get("walks", 0) + 1
+def new_map():
+    return {"kind": "house", "samples": [], "labels": [], "distance": 0.0, "walks": 0}
+
+
+def merge_walk(m, samples, distance=0.0, ssid=None):
+    """A new map dict: `m` (or a new map) plus one walk. `m` itself is not changed."""
+    m = dict(m) if m else new_map()
+    m["samples"] = list(m.get("samples") or []) + list(samples)
+    m["labels"] = m.get("labels") or []
+    m["distance"] = round((m.get("distance") or 0) + (distance or 0), 1)
+    m["walks"] = (m.get("walks") or 0) + 1
     m["saved"] = time.time()
-    m["ssid"] = (rec.latest or {}).get("ssid", m.get("ssid", ""))
+    m["ssid"] = ssid or m.get("ssid", "")
     return m
 
 
+def add_walk(m, rec):
+    """The house map `m` (or a new one) with the recorder's walk added (a new dict)."""
+    return merge_walk(m, rec.samples, rec.distance, (rec.latest or {}).get("ssid"))
+
+
+def finish_walk(m, rec):
+    """Adds a finished walk to the map and saves it; the walk's autosave is no longer needed.
+    Returns the new map (`m` unchanged if the walk has no positions)."""
+    if rec.samples:
+        m = add_walk(m, rec)
+        save(m)
+    discard_inprogress()
+    return m
+
+
+def inprogress_path(pid=None):
+    """This app's walk-in-progress file (one per running Deckhand, so a second window never takes
+    over a walk that is still going)."""
+    return os.path.join(HOUSE, f"walk-inprogress-{pid or os.getpid()}.json")
+
+
+def discard_inprogress():
+    try:
+        os.remove(inprogress_path())
+    except OSError:
+        pass
+
+
+def _deckhand_running(pid):
+    if pid == os.getpid():
+        return False  # left by an earlier run with our number: nothing of ours is walking yet
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"deckhand" in f.read()
+    except OSError:
+        return False
+
+
+def recover():
+    """Adds walks that were cut short (Deckhand closed or crashed mid-walk) to the saved map.
+    Returns how many positions came back (0: nothing to recover). Call once at start-up,
+    before a walk starts."""
+    try:
+        names = [f for f in os.listdir(HOUSE) if f.startswith("walk-inprogress-") and f.endswith(".json")]
+    except OSError:
+        return 0
+    total = 0
+    for name in sorted(names):
+        try:
+            pid = int(name[len("walk-inprogress-"):-len(".json")])
+        except ValueError:
+            pid = 0
+        if pid and _deckhand_running(pid):
+            continue  # another Deckhand window is walking right now
+        path = os.path.join(HOUSE, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                w = json.load(f)
+        except (OSError, ValueError):
+            w = None
+        samples = clean_samples(w.get("samples")) if isinstance(w, dict) else []
+        if samples:
+            m = load()
+            segs = [smp[SEG] for smp in (m or {}).get("samples", [])]
+            shift = (max(segs) + 1 if segs else 0) - min(smp[SEG] for smp in samples)
+            samples = [smp[:SEG] + [smp[SEG] + shift] + smp[SEG + 1:] for smp in samples]  # its own paths
+            save(merge_walk(m, samples, w.get("distance") or 0, w.get("ssid")))
+            total += len(samples)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return total
+
+
 # ------------------------------------------------------------- analysis ---
+def clean_samples(samples):
+    """Samples with a real position (drops damaged entries rather than failing on them)."""
+    out = []
+    for s in samples or []:
+        try:
+            if len(s) > SEG and all(math.isfinite(s[i]) for i in (0, 1, 2)):
+                out.append(s)
+        except TypeError:
+            continue
+    return out
+
+
 def floor_of(y, base):
     return int(round((y - base) / FLOOR_HEIGHT))
 
@@ -164,9 +247,10 @@ def rate(s, target):
     return (s[i] if len(s) > i else None) or 0
 
 
-def cells(samples, target="wifi"):
-    """{(floor, i, j): (avg dBm, avg Mbit/s, count)} for the chosen signal."""
-    base = floor_base(samples)
+def cells(samples, target="wifi", base=None):
+    """{(floor, i, j): (avg dBm, avg Mbit/s, count)} for the chosen signal. `base`: the map's
+    floor_base() when `samples` is only part of the map."""
+    base = floor_base(samples) if base is None else base
     acc = {}
     for s in samples:
         v = value(s, target)
@@ -180,15 +264,15 @@ def cells(samples, target="wifi"):
     return {k: (v[0] / v[2], v[1] / v[2], v[2]) for k, v in acc.items()}
 
 
-def footprint(samples):
+def footprint(samples, base=None):
     """{(floor, i, j)} squares walked (whatever was measured there)."""
-    base = floor_base(samples)
+    base = floor_base(samples) if base is None else base
     return {(floor_of(s[1], base), int(s[0] // CELL), int(s[2] // CELL)) for s in samples}
 
 
 def outline_edges(samples, floor):
     """Edges of the walked area on one floor (where a walked square meets an unwalked one): the
-    fallback outline of the rooms. [(x0, z0, x1, z1)]"""
+    outline of the rooms. [(x0, z0, x1, z1)]"""
     sq = {(i, j) for f, i, j in footprint(samples) if f == floor}
     edges = []
     for i, j in sq:
@@ -253,56 +337,101 @@ PREFS = os.path.expanduser("~/.config/frame-settings/house.json")
 
 def prefs():
     """{'minimap': show the mini-map in view, 'angle': the map's rotation in degrees}"""
-    p = {"minimap": True, "angle": 0}
+    p = {"minimap": True, "angle": 0.0}
     try:
         with open(PREFS, encoding="utf-8") as f:
-            p.update(json.load(f))
+            d = json.load(f)
+        if isinstance(d, dict):
+            p.update({k: d[k] for k in p if k in d})
     except (OSError, ValueError):
         pass
+    try:
+        p["angle"] = float(p["angle"]) % 360
+    except (TypeError, ValueError):
+        p["angle"] = 0.0
+    p["minimap"] = bool(p["minimap"])
     return p
 
 
 def save_prefs(p):
-    os.makedirs(os.path.dirname(PREFS), exist_ok=True)
-    with open(PREFS, "w", encoding="utf-8") as f:
-        json.dump(p, f)
+    try:
+        write_json(PREFS, p)
+    except OSError:
+        pass  # a view preference isn't worth an error message
 
 
 # -------------------------------------------------------------- storage ---
-def save(m):
-    os.makedirs(HOUSE, exist_ok=True)
-    tmp = CURRENT + ".tmp"
+def write_json(path, data):
+    """Writes the whole file or nothing (a crash or power loss never leaves half a file)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(m, f)
-    os.replace(tmp, CURRENT)
-    return CURRENT
+        json.dump(data, f)
+    os.replace(tmp, path)
+    return path
+
+
+def save(m):
+    return write_json(CURRENT, m)
+
+
+def _read_map(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        if path == CURRENT:  # unreadable: set it aside instead of overwriting it on the next save
+            try:
+                os.replace(path, path + time.strftime(".damaged-%Y%m%d-%H%M%S"))
+            except OSError:
+                pass
+        return None
+    return m if isinstance(m, dict) else None
 
 
 def load():
-    """The current house map. The first time, an older single-walk save (house-*.json) is taken over."""
-    try:
-        with open(CURRENT, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        pass
-    try:
-        old = sorted(f for f in os.listdir(HOUSE) if f.startswith("house-") and f.endswith(".json"))
-        with open(os.path.join(HOUSE, old[-1]), encoding="utf-8") as f:
-            m = json.load(f)
-    except (OSError, ValueError, IndexError):
+    """The current house map, or None. The first time, an older single-walk save (house-*.json) is
+    taken over."""
+    m = _read_map(CURRENT)
+    if m is None:
+        try:
+            old = sorted(f for f in os.listdir(HOUSE) if f.startswith("house-") and f.endswith(".json"))
+        except OSError:
+            old = []
+        for name in reversed(old):
+            m = _read_map(os.path.join(HOUSE, name))
+            if m and m.get("samples"):
+                m.setdefault("walks", 1)
+                break
+            m = None
+    if m is None:
         return None
-    m.setdefault("walks", 1)
-    return m if m.get("samples") else None
+    m["samples"] = clean_samples(m.get("samples"))
+    m["labels"] = [lab for lab in (m.get("labels") or []) if isinstance(lab, dict)
+                   and {"name", "x", "z"} <= lab.keys()]
+    return m
 
 
 def clear():
-    """Start fresh: the current map (and any older saves) are kept as dated backups, then removed."""
+    """Start fresh: the current map (and any older saves) are kept as dated backups (the newest
+    three Clear presses), then removed."""
+    discard_inprogress()
     if not os.path.isdir(HOUSE):
         return
     stamp = time.strftime("%Y%m%d-%H%M%S")
     for f in os.listdir(HOUSE):
         if f == "current.json" or (f.startswith("house-") and f.endswith(".json")):
             os.replace(os.path.join(HOUSE, f), os.path.join(HOUSE, f"cleared-{stamp}-{f}"))
+    backups = [f for f in os.listdir(HOUSE) if f.startswith("cleared-")]
+    keep = sorted({f.split("-")[1] + f.split("-")[2] for f in backups if f.count("-") >= 3})[-KEEP_CLEARED:]
+    for f in backups:
+        if f.count("-") >= 3 and f.split("-")[1] + f.split("-")[2] not in keep:
+            try:
+                os.remove(os.path.join(HOUSE, f))
+            except OSError:
+                pass
 
 
 # ------------------------------------------------------------- mini-map ---
@@ -336,17 +465,20 @@ def minimap_svg(m, pose, heading, target="wifi", reading=None, size=420, radius=
             f'stroke="#66ccff" stroke-opacity="0.8" stroke-width="4"/>']
     title = r.get("name", TARGETS[target]).upper() + (f" · {r['word']}" if r.get("dbm") is not None else "")
     head.append(f'<text x="{c:.1f}" y="44" fill="#c9d6e3" font-size="24" font-weight="bold" text-anchor="middle" '
-                f'font-family="sans-serif">{title}</text>')
+                f'font-family="sans-serif">{html.escape(title)}</text>')
     big = r.get("note") or (f"{r['dbm']:.0f} dBm" if r.get("dbm") is not None else "no signal")
-    head.append(f'<text x="{c:.1f}" y="{HEADER - 30}" fill="{r.get("colour", "#ffffff") if not r.get("note") else "#ffffff"}" '
+    big_colour = "#ffffff" if r.get("note") else r.get("colour", "#ffffff")
+    head.append(f'<text x="{c:.1f}" y="{HEADER - 30}" fill="{big_colour}" '
                 f'font-size="66" font-weight="bold" text-anchor="middle" font-family="sans-serif" stroke="#0e141b" '
-                f'stroke-width="6" paint-order="stroke">{big}</text>')
+                f'stroke-width="6" paint-order="stroke">{html.escape(big)}</text>')
     parts = [f'<defs><clipPath id="r"><rect x="4" y="4" width="{size - 8}" height="{size - 8}" rx="34"/>'
              f'</clipPath></defs>',
              f'<rect x="4" y="4" width="{size - 8}" height="{size - 8}" rx="34" fill="#0e141b" fill-opacity="0.6"/>',
              '<g clip-path="url(#r)">']
-    measured = cells(samples, target)
-    for f, i, j in footprint(samples):
+    # Only the squares around you matter: a quick box test first keeps this light on a big map.
+    near = [s for s in samples if abs(s[0] - px) <= reach + CELL and abs(s[2] - pz) <= reach + CELL]
+    measured = cells(near, target, base)
+    for f, i, j in footprint(near, base):
         if f != floor:
             continue
         x0, z0 = i * CELL, j * CELL
@@ -356,10 +488,20 @@ def minimap_svg(m, pose, heading, target="wifi", reading=None, size=420, radius=
         colour = wifi_map.fill(v[0]) if v else "#2a3440"
         parts.append(f'<polygon points="{pts(((x0, z0), (x0 + CELL, z0), (x0 + CELL, z0 + CELL), (x0, z0 + CELL)))}" '
                      f'fill="{colour}" fill-opacity="0.8"/>')
-    recent = [(s[0], s[2]) for s in samples[-240:] if floor_of(s[1], base) == floor
-              and math.hypot(s[0] - px, s[2] - pz) < reach]
-    if len(recent) > 1:
-        parts.append(f'<polyline points="{pts(recent)}" fill="none" stroke="#ffffff" stroke-opacity="0.45" '
+    runs, run, seg = [], [], None  # your recent path: broken where tracking jumped or it leaves the view
+    for s in samples[-240:]:
+        keep = floor_of(s[1], base) == floor and math.hypot(s[0] - px, s[2] - pz) < reach
+        if not keep or s[SEG] != seg:
+            if len(run) > 1:
+                runs.append(run)
+            run = []
+        seg = s[SEG]
+        if keep:
+            run.append((s[0], s[2]))
+    if len(run) > 1:
+        runs.append(run)
+    for run in runs:
+        parts.append(f'<polyline points="{pts(run)}" fill="none" stroke="#ffffff" stroke-opacity="0.45" '
                      f'stroke-width="3" stroke-linejoin="round"/>')
     for lab in m.get("labels", []):
         if lab.get("floor", 0) == floor and math.hypot(lab["x"] - px, lab["z"] - pz) < reach:

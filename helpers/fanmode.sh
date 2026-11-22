@@ -16,6 +16,9 @@
 #   fanmode poweroff                                  shut the Frame down (fallback
 #                                                     when Steam's own shutdown fails)
 #   fanmode check                                     prints "ok <version>"
+# Runs as root from sudo: a fixed PATH and locale, so nothing from the caller's
+# environment picks the programs it runs or how it writes numbers.
+PATH=/usr/bin:/usr/sbin:/bin:/sbin; export PATH; umask 022; export LC_ALL=C
 set -eu
 VERSION=4
 
@@ -50,9 +53,14 @@ case "${1:-}" in
       || { echo "floors must be whole numbers 0-55" >&2; exit 2; }
     is_int "$SCALE" && [ "$SCALE" -ge 50 ] && [ "$SCALE" -le 100 ] \
       || { echo "strength must be a whole number 50-100" >&2; exit 2; }
+    # plain decimals ("08" would be read as text by the YAML config)
+    FLOOR=$((10#$FLOOR)) CHG=$((10#$CHG)) SCALE=$((10#$SCALE))
     [ -f "$SRC/fancontrol.py" ] || { echo "Valve fan controller not found in $SRC" >&2; exit 3; }
     mkdir -p "$DST"
-    cp -p "$SRC/fancontrol.py" "$SRC/PID.py" "$DST/"
+    # Written under .new names and renamed into place only when all three are complete, so a
+    # full disk never leaves a half-written controller for the running service to restart with.
+    cp -p "$SRC/fancontrol.py" "$DST/fancontrol.py.new"
+    cp -p "$SRC/PID.py" "$DST/PID.py.new"
     # Floors replaced; the curve's coefficients (quadratic on temperature,
     # linear feed-forward on power) multiplied by strength/100.
     {
@@ -63,7 +71,8 @@ case "${1:-}" in
         /^(A|B|C)_quad_control:|^(A|B)_ff_control:/ {
           printf "%s %s %.8g\n", $1, $2, $3 * k / 100; next }
         { print }' "$SRC/deckard-config.yaml"
-    } > "$DST/deckard-config.yaml"
+    } > "$DST/deckard-config.yaml.new"
+    for f in fancontrol.py PID.py deckard-config.yaml; do mv -f "$DST/$f.new" "$DST/$f"; done
     mkdir -p "$DROPIN_DIR"
     printf '[Service]\nExecStart=\nExecStart=%s/fancontrol.py --run\nExecStopPost=\nExecStopPost=%s/fancontrol.py --stop\n' \
       "$DST" "$DST" > "$DROPIN"
@@ -89,7 +98,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    sed -n '2,19p' "$0" >&2
+    sed -n '2,18p' "$0" >&2
     exit 2
     ;;
 esac

@@ -9,8 +9,9 @@
 #
 # Removes: its background services (auto shut-off, sleep timer, ceiling indicator, reminders,
 # kitchen timer, live readouts), the fan helper and its password-free sudo rule (fan back to stock),
-# the Steam library shortcut and app-menu entry, and this folder. SteamVR itself, its settings and
-# the room/boundary SteamVR is using are not touched. A log is left in /tmp/deckhand-uninstall.log.
+# the Steam library shortcut and app-menu entry, and Deckhand's own files in this folder (the folder
+# too once it's empty: anything else you put in it stays). SteamVR itself, its settings and the
+# room/boundary SteamVR is using are not touched. A log is left in /tmp/deckhand-uninstall.log.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 KEEP=0
@@ -39,14 +40,20 @@ act systemctl --user daemon-reload
 
 # Fan helper (root). Version 4+ removes itself and its sudo rule; older ones can only restore the fan.
 LEFT=0
-if [ -e /etc/frame-settings/fanmode ]; then
-  VER=$(sudo -n /etc/frame-settings/fanmode check 2>/dev/null | awk '{print $2}')
+FAN_FIX=""
+FAN=/etc/frame-settings/fanmode
+if [ -e "$FAN" ]; then
+  VER=$(sudo -n "$FAN" check 2>/dev/null | awk '{print $2}')
   if [ "${VER:-0}" -ge 4 ] 2>/dev/null; then
-    act sudo -n /etc/frame-settings/fanmode uninstall
+    act sudo -n "$FAN" uninstall || FAN_FIX="sudo $FAN uninstall"
   else
-    act sudo -n /etc/frame-settings/fanmode off
+    act sudo -n "$FAN" off || FAN_FIX="sudo $FAN off"
     LEFT=1
   fi
+elif [ -e /etc/systemd/system/deckard-fan-control.service.d/quiet.conf ]; then
+  # the helper is gone but its quiet fan settings are still in use
+  FAN_FIX="sudo rm -rf /etc/systemd/system/deckard-fan-control.service.d/quiet.conf /etc/deckard-fan-control-quiet"
+  FAN_FIX="$FAN_FIX && sudo systemctl daemon-reload && sudo systemctl restart deckard-fan-control.service"
 fi
 
 # Steam library shortcut, app-menu entry, icon
@@ -55,20 +62,38 @@ act env -u SteamAppId -u SteamGameId -u LD_PRELOAD python3 "$HERE/app/steam_shor
 
 # Data
 act rm -rf ~/.cache/frame-settings
+[ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR/deckhand" ] && act rm -rf "$XDG_RUNTIME_DIR/deckhand"
 if [ "$KEEP" = 0 ]; then
   act rm -rf ~/.config/frame-settings ~/.local/share/frame-settings ~/Documents/Deckhand
 else
   echo "keeping: ~/.config/frame-settings ~/.local/share/frame-settings ~/Documents/Deckhand"
 fi
 
-# The app itself (only a folder that really is Deckhand)
+# The app itself: only a folder that really is Deckhand, only Deckhand's own files in it, then the
+# folder if nothing else is left (rmdir never deletes a folder with other files in it). The names
+# after .gitignore are the old flat layout's (1.0.4 and earlier), in case an update left any.
 if [ -f "$HERE/app/deckhand.py" ] && [ -f "$HERE/app/updater.py" ] && [ "$HERE" != "$HOME" ] && [ "$HERE" != "/" ]; then
-  act rm -rf "$HERE"
+  for name in app helpers assets tools logs preview README.md VERSION install.sh uninstall.sh setup.sh \
+              launch.sh .gitattributes .gitignore \
+              frame_settings.py ceiling.py house_map.py kitchen_timer.py power.py reminders.py rooms.py \
+              wifi_map.py steam_shortcut.py updater.py build.sh fanmode.sh timer_overlay chaperone_tool \
+              space_tool ceiling_overlay src __pycache__ setup.log last-run.log power.log power.log.old; do
+    if [ -e "$HERE/$name" ] || [ -L "$HERE/$name" ]; then
+      act rm -rf "${HERE:?}/$name"
+    fi
+  done
+  act rmdir "$HERE" 2>/dev/null || echo "Kept $HERE: it has other files in it."
 fi
 
+if [ -n "$FAN_FIX" ]; then
+  echo
+  echo "The fan helper didn't finish, so the fan may still run on Deckhand's settings."
+  echo "To put it back to stock, run this in Konsole (it asks for your password):"
+  echo "  $FAN_FIX"
+fi
 if [ "$LEFT" = 1 ]; then
   echo
   echo "Two system files from an older fan setup need your password to remove. In Konsole run:"
-  echo "  sudo rm -f /etc/sudoers.d/zz-frame-settings && sudo rm -rf /etc/frame-settings"
+  echo "  sudo rm -f /etc/sudoers.d/zz-frame-settings /etc/sudoers.d/frame-settings && sudo rm -rf /etc/frame-settings"
 fi
 echo "Deckhand removed.${DRY:+ (dry run: nothing was changed)}"

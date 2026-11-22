@@ -24,11 +24,12 @@ doesn't have (yet). Runs from your Steam library, in VR, no desktop mode needed.
 On the Frame, switch to **Desktop mode**, open **Konsole**, type this and press Enter:
 
 ```bash
-curl -L is.gd/deckhandvr|sh
+curl -fsSL https://is.gd/deckhandvr|sh
 ```
 
 (`is.gd/deckhandvr` is a short link to this repo's `install.sh`. The full command, if you'd rather paste it:
-`curl -fsSL https://raw.githubusercontent.com/SkillNotRequired/deckhand/main/install.sh | bash`)
+`curl -fsSL https://raw.githubusercontent.com/SkillNotRequired/deckhand/main/install.sh | bash`.
+Run it as your normal user, not with sudo.)
 
 It installs into `~/Deckhand`, builds its small helpers (g++ ships with SteamOS on the Frame), and adds
 Deckhand to your Steam library and app menu. Then go back to Game mode and open it like any game.
@@ -67,7 +68,8 @@ command again (do that once if you installed 1.0.4 or older: the folder layout c
 
 System tab > **Remove Deckhand**. It warns you first, then removes the app, its Steam and app-menu
 entries, its background jobs and the fan helper (fan back to stock); tick the box to keep your saved
-rooms and maps. From Konsole: `~/Deckhand/uninstall.sh` (or `--keep-data`).
+rooms and maps. From Konsole: `~/Deckhand/uninstall.sh` (or `--keep-data`). Only Deckhand's own files
+are deleted: anything else you put in its folder stays, and so does the folder.
 
 ## Notes
 

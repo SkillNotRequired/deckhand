@@ -8,85 +8,96 @@ The Frame has two separate radio links:
 While you walk around, a Recorder pairs the headset's position (space_tool track) with
 the strength of both links, twice a second. The samples are averaged into 0.5 m squares
 and drawn over your boundary; the strongest square is the best place to stand.
-Nothing runs unless you are mapping.
+Nothing runs unless you are mapping (or a map page shows where you are).
 """
 import json
+import math
 import os
 import re
 import subprocess
 import threading
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-import paths  # noqa: E402
+import paths
+
 SPACE_TOOL = paths.tool("space_tool")
 MAPS = os.path.expanduser("~/.local/share/frame-settings/wifi")
 CELL = 0.5          # metres per square
 MAX_SECONDS = 300   # mapping stops by itself after 5 min
 SAMPLE_EVERY = 0.5  # seconds
+IW_CACHE = 30.0     # seconds an `iw dev` interface list stays valid
+
+
+# ------------------------------------------------------------ radio links ---
+def _iw(*args, timeout=3):
+    try:
+        return subprocess.run(["iw", *args], capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+_IFACES = {"at": -1e9, "found": {}}
+
+
+def interfaces(fresh=False):
+    """{interface: type} from `iw dev` ("managed" = Wi-Fi client, "AP" = the dongle's access point).
+    Cached for 30 s: the list hardly ever changes and this is asked twice a second while mapping."""
+    now = time.monotonic()
+    if fresh or now - _IFACES["at"] > IW_CACHE:
+        found, iface = {}, None
+        for line in _iw("dev").splitlines():
+            line = line.strip()
+            if line.startswith("Interface "):
+                iface = line.split()[1]
+            elif line.startswith("type ") and iface:
+                found[iface] = line.split(None, 1)[1]
+        _IFACES.update(at=now, found=found)
+    return _IFACES["found"]
 
 
 def station_interface():
-    """The Wi-Fi interface connected to a network as a client (not the dongle's access point)."""
-    r = subprocess.run(["iw", "dev"], capture_output=True, text=True)
-    iface = None
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("Interface "):
-            iface = line.split()[1]
-        elif line == "type managed" and iface:
-            return iface
-    return "wlan0"
-
-
-def signal(iface=None):
-    """{'dbm', 'tx', 'rx', 'freq', 'ssid'} of the current Wi-Fi link, or None if not connected."""
-    iface = iface or station_interface()
-    r = subprocess.run(["iw", "dev", iface, "link"], capture_output=True, text=True)
-    if "Connected" not in r.stdout:
-        return None
-
-    def num(pattern):
-        m = re.search(pattern, r.stdout)
-        return float(m.group(1)) if m else None
-    ssid = re.search(r"SSID:\s*(.+)", r.stdout)
-    return {"dbm": num(r"signal:\s*(-?\d+)"), "tx": num(r"tx bitrate:\s*([\d.]+)"),
-            "rx": num(r"rx bitrate:\s*([\d.]+)"), "freq": num(r"freq:\s*([\d.]+)"),
-            "ssid": ssid.group(1).strip() if ssid else "", "iface": iface}
+    """The Wi-Fi interface used as a client of a network (not the dongle's access point)."""
+    return next((i for i, t in interfaces().items() if t == "managed"), "wlan0")
 
 
 def ap_interface():
     """The Frame's own access point (the dongle's link), or None."""
-    r = subprocess.run(["iw", "dev"], capture_output=True, text=True)
-    iface = None
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("Interface "):
-            iface = line.split()[1]
-        elif line == "type AP" and iface:
-            return iface
-    return None
+    return next((i for i, t in interfaces().items() if t == "AP"), None)
+
+
+def _num(pattern, text):
+    m = re.search(pattern, text)
+    return float(m.group(1)) if m else None
+
+
+def signal(iface=None):
+    """{'dbm', 'tx', 'rx', 'freq', 'ssid', 'iface'} of the current Wi-Fi link, or None if not connected."""
+    iface = iface or station_interface()
+    out = _iw("dev", iface, "link")
+    if "Connected" not in out:
+        return None
+    ssid = re.search(r"SSID:\s*(.+)", out)
+    return {"dbm": _num(r"signal:\s*(-?\d+)", out), "tx": _num(r"tx bitrate:\s*([\d.]+)", out),
+            "rx": _num(r"rx bitrate:\s*([\d.]+)", out), "freq": _num(r"freq:\s*([\d.]+)", out),
+            "ssid": ssid.group(1).strip() if ssid else "", "iface": iface}
 
 
 def dongle_signal(iface=None):
-    """{'dbm', 'tx', 'rx', 'freq'} of the Steam dongle's link to the Frame, or None if not connected.
-    Strength = how loudly the Frame hears the dongle's acknowledgements (the plain "signal" field
-    reads 0 on this access point)."""
+    """{'dbm', 'tx', 'rx', 'freq', 'ssid', 'iface'} of the Steam dongle's link to the Frame, or None if
+    not connected. Strength = how loudly the Frame hears the dongle's acknowledgements (the plain
+    "signal" field reads 0 on this access point)."""
     iface = iface or ap_interface()
     if not iface:
         return None
-    r = subprocess.run(["iw", "dev", iface, "station", "dump"], capture_output=True, text=True)
     best = None
-    for block in r.stdout.split("Station ")[1:]:
-        def num(pattern):
-            m = re.search(pattern, block)
-            return float(m.group(1)) if m else None
-        dbm = num(r"avg ack signal:\s*(-?\d+)") or num(r"last ack signal:\s*(-?\d+)") or num(r"signal avg:\s*(-?\d+)")
-        if dbm is None or dbm == 0:
+    for block in _iw("dev", iface, "station", "dump").split("Station ")[1:]:
+        dbm = (_num(r"avg ack signal:\s*(-?\d+)", block) or _num(r"last ack signal:\s*(-?\d+)", block)
+               or _num(r"signal avg:\s*(-?\d+)", block))
+        if not dbm:  # None or 0: no real reading
             continue
-        if (num(r"inactive time:\s*(\d+)") or 0) > 30000:  # gone quiet: not really connected
+        if (_num(r"inactive time:\s*(\d+)", block) or 0) > 30000:  # gone quiet: not really connected
             continue
-        s = {"dbm": dbm, "tx": num(r"tx bitrate:\s*([\d.]+)"), "rx": num(r"rx bitrate:\s*([\d.]+)"),
+        s = {"dbm": dbm, "tx": _num(r"tx bitrate:\s*([\d.]+)", block), "rx": _num(r"rx bitrate:\s*([\d.]+)", block),
              "freq": 6000, "ssid": "Steam dongle", "iface": iface}
         if best is None or dbm > best["dbm"]:
             best = s
@@ -155,106 +166,168 @@ def band(freq):
     return "6 GHz" if freq >= 5925 else "5 GHz" if freq >= 4900 else "2.4 GHz"
 
 
+# -------------------------------------------------------------- tracking ---
 def live_bounds():
     """Boundary outline on the floor right now [(x, z), ...] (standing space), or []."""
     try:
-        r = subprocess.run([SPACE_TOOL, "bounds"], capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
+        r = subprocess.run([SPACE_TOOL, "bounds"], capture_output=True, text=True, timeout=15,
+                           env=paths.clean_env())
+        return [(float(a), float(b)) for a, b in re.findall(r"^b (\S+) (\S+)$", r.stdout, re.M)]
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return []
-    return [(float(a), float(b)) for a, b in re.findall(r"^b (\S+) (\S+)$", r.stdout, re.M)]
 
 
-class Recorder:
-    """Walk-around recording. start() → (thread) samples; stop() → map dict (also saved)."""
+class PoseWatcher:
+    """Where the headset is right now: space_tool track as a background SteamVR app (it never starts
+    SteamVR). pose = (x, y, z) in standing space, or None while the headset isn't tracked;
+    heading = the look direction on the floor (x, z). stop() ends it."""
 
-    def __init__(self):
-        self.samples = []      # [x, z, wifi dbm, wifi tx, dongle dbm, dongle tx] (None = not connected)
-        self.pose = None       # latest headset (x, z) or None
-        self.latest = None     # latest signal()
-        self.latest_dongle = None
-        self.running = False
-        self.started = 0.0
+    def __init__(self, every_ms=500):
+        self.pose = None
+        self.heading = (0.0, -1.0)
+        self.every_ms = every_ms
         self.proc = None
-        self.bounds = []
-        self.iface = self.ap = None
+        self.running = False
+        self.ended = False   # the tool quit by itself (SteamVR stopped?): no more positions
+        self._wake = threading.Event()  # set by stop(): wakes a sampler thread from its pause
 
     def start(self):
         if not os.access(SPACE_TOOL, os.X_OK):
             raise RuntimeError("space_tool is missing: run helpers/build.sh on the Frame")
+        self.pose, self.ended = None, False
+        self._wake.clear()
+        self.proc = subprocess.Popen([SPACE_TOOL, "track", str(self.every_ms)], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, text=True, env=paths.clean_env())
+        self.running = True
+        threading.Thread(target=self._read_poses, args=(self.proc,), daemon=True).start()
+        return self
+
+    def _read_poses(self, proc):
+        try:
+            for line in proc.stdout:
+                if not self.running or proc is not self.proc:
+                    break
+                p = line.split()
+                if len(p) != 8 or p[0] != "p" or p[1] != "hmd":
+                    continue
+                try:
+                    x, y, z, fx, fz = (float(v) for v in p[3:8])
+                except ValueError:
+                    continue
+                if p[2] != "1" or not all(map(math.isfinite, (x, y, z, fx, fz))):
+                    self.pose = None  # not tracked right now
+                    continue
+                self.pose = (x, y, z)
+                if math.hypot(fx, fz) > 0.2:  # looking (nearly) straight up or down: keep the last heading
+                    self.heading = (fx, fz)
+        except (OSError, ValueError):
+            pass
+        if proc is self.proc:  # ended by itself, not by stop(): a stale position would mislead
+            self.pose = None
+            self.ended = self.running
+
+    def alive(self):
+        return bool(self.running and self.proc and not self.ended)
+
+    def stop(self):
+        self.running = False
+        self._wake.set()
+        proc, self.proc = self.proc, None
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if proc.stdout:
+                proc.stdout.close()
+        return self
+
+
+class Recorder(PoseWatcher):
+    """Play-space walk. start() → samples both links twice a second (thread); stop() → map dict (saved)."""
+
+    def __init__(self):
+        super().__init__(every_ms=200)
+        self.samples = []      # [x, z, wifi dbm, wifi tx, dongle dbm, dongle tx] (None = not connected)
+        self.latest = None     # latest signal()
+        self.latest_dongle = None
+        self.started = 0.0
+        self.bounds = []
+        self.iface = self.ap = None
+        self._sampler = None
+
+    def start(self):
+        """Slow (reads the boundary from SteamVR): call it off the UI thread."""
+        if not os.access(SPACE_TOOL, os.X_OK):
+            raise RuntimeError("space_tool is missing: run helpers/build.sh on the Frame")
         self.iface, self.ap = station_interface(), ap_interface()
-        if not signal(self.iface) and not dongle_signal(self.ap):
+        self.latest, self.latest_dongle = signal(self.iface), dongle_signal(self.ap)
+        if not self.latest and not self.latest_dongle:
             raise RuntimeError("neither home Wi-Fi nor the Steam dongle is connected")
         self.bounds = live_bounds()
-        self.proc = subprocess.Popen([SPACE_TOOL, "track", "200"], stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, text=True)
-        self.samples, self.pose, self.running, self.started = [], None, True, time.time()
-        threading.Thread(target=self._read_poses, daemon=True).start()
-        threading.Thread(target=self._sample, daemon=True).start()
-
-    def _read_poses(self):
-        for line in self.proc.stdout:
-            parts = line.split()
-            if len(parts) == 8 and parts[0] == "p" and parts[1] == "hmd":
-                self.pose = (float(parts[3]), float(parts[5])) if parts[2] == "1" else None
-            if not self.running:
-                break
+        self.samples = []
+        super().start()
+        self.started = time.monotonic()
+        self._sampler = threading.Thread(target=self._sample, daemon=True)
+        self._sampler.start()
+        return self
 
     def _sample(self):
         while self.running:
-            if time.time() - self.started > MAX_SECONDS:
-                self.running = False
+            if self.elapsed() > MAX_SECONDS:
+                self.running = False  # the app sees this and finishes the map
                 break
             s = signal(self.iface)
             d = dongle_signal(self.ap) if self.ap else None
             self.latest, self.latest_dongle = s, d
             s = s if s and s["dbm"] is not None else None
-            if (s or d) and self.pose:
-                self.samples.append([round(self.pose[0], 2), round(self.pose[1], 2),
+            pose = self.pose
+            if (s or d) and pose:
+                self.samples.append([round(pose[0], 2), round(pose[2], 2),
                                      s["dbm"] if s else None, s["tx"] if s else None,
                                      d["dbm"] if d else None, d["tx"] if d else None])
-            time.sleep(SAMPLE_EVERY)
+            self._wake.wait(SAMPLE_EVERY)
 
     def elapsed(self):
-        return time.time() - self.started if self.started else 0
+        return time.monotonic() - self.started if self.started else 0
 
     def stop(self):
-        self.running = False
-        if self.proc:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-            self.proc = None
-        m = {"saved": time.time(), "bounds": self.bounds, "samples": self.samples,
+        super().stop()
+        if self._sampler and self._sampler is not threading.current_thread():
+            self._sampler.join(timeout=1)  # its last reading lands before the map is made
+        samples = list(self.samples)
+        m = {"saved": time.time(), "bounds": self.bounds, "samples": samples,
              "ssid": (self.latest or {}).get("ssid", ""), "freq": (self.latest or {}).get("freq")}
         m.update(summarise(m))
-        if self.samples:
+        if samples:
             save(m)
         return m
 
 
+# -------------------------------------------------------------- analysis ---
 def grid(samples, target="wifi"):
     """{(i, j): (avg dBm, avg Mbit/s, count)} for 0.5 m squares, for one link."""
     k = 4 if target == "dongle" else 2
     cells = {}
     for smp in samples:
-        x, z = smp[0], smp[1]
-        dbm = smp[k] if len(smp) > k else None
-        tx = smp[k + 1] if len(smp) > k + 1 else None
-        if dbm is None:
+        if len(smp) <= k:
             continue
-        key = (int((x // CELL)), int((z // CELL)))
-        c = cells.setdefault(key, [0.0, 0.0, 0])
+        x, z, dbm = smp[0], smp[1], smp[k]
+        if dbm is None or not (math.isfinite(x) and math.isfinite(z)):
+            continue
+        tx = smp[k + 1] if len(smp) > k + 1 else None
+        c = cells.setdefault((int(x // CELL), int(z // CELL)), [0.0, 0.0, 0])
         c[0] += dbm
         c[1] += tx or 0
         c[2] += 1
-    return {k: (v[0] / v[2], v[1] / v[2], v[2]) for k, v in cells.items()}
+    return {key: (v[0] / v[2], v[1] / v[2], v[2]) for key, v in cells.items()}
 
 
 def summarise(m):
     """Best / worst / average for home Wi-Fi at the top level (older maps), and per link under
-    m["wifi"] and m["dongle"]."""
+    m["links"]["wifi"] and m["links"]["dongle"]."""
     out = summarise_one(m, "wifi")
     out["links"] = {t: summarise_one(m, t) for t in TARGETS}
     return out
@@ -286,27 +359,44 @@ def where(at):
     return ", ".join(parts) or "right where the room starts"
 
 
+# --------------------------------------------------------------- storage ---
 def save(m):
     os.makedirs(MAPS, exist_ok=True)
     path = os.path.join(MAPS, time.strftime("map-%Y%m%d-%H%M%S.json"))
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(m, f)
+    os.replace(tmp, path)
     return path
 
 
 def clear():
-    """Start fresh: saved maps are renamed out of the way (kept as .cleared backups)."""
+    """Start fresh: saved maps are renamed out of the way (kept as .cleared backups, the newest 20)."""
     if not os.path.isdir(MAPS):
         return
     for f in os.listdir(MAPS):
         if f.endswith(".json"):
             os.replace(os.path.join(MAPS, f), os.path.join(MAPS, f + ".cleared"))
+    old = sorted(f for f in os.listdir(MAPS) if f.endswith(".cleared"))
+    for f in old[:-20]:
+        try:
+            os.remove(os.path.join(MAPS, f))
+        except OSError:
+            pass
 
 
 def last_map():
+    """The newest saved map that reads correctly, or None."""
     try:
-        files = sorted(f for f in os.listdir(MAPS) if f.endswith(".json"))
-        with open(os.path.join(MAPS, files[-1]), encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError, IndexError):
+        files = sorted((f for f in os.listdir(MAPS) if f.endswith(".json")), reverse=True)
+    except OSError:
         return None
+    for name in files:
+        try:
+            with open(os.path.join(MAPS, name), encoding="utf-8") as f:
+                m = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(m, dict):
+            return m
+    return None

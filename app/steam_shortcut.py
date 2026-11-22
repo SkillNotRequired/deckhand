@@ -41,17 +41,21 @@ def ws_connect(url):
     hostport, path = rest.split("/", 1)
     host, port = hostport.split(":")
     s = socket.create_connection((host, int(port)), timeout=15)
-    key = base64.b64encode(os.urandom(16)).decode()
-    s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\nUpgrade: websocket\r\n"
-               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
-    resp = b""
-    while b"\r\n\r\n" not in resp:
-        chunk = s.recv(4096)
-        if not chunk:
-            raise ConnectionError("DevTools closed the connection during the handshake")
-        resp += chunk
-    if b" 101 " not in resp.split(b"\r\n", 1)[0]:
-        raise ConnectionError(resp.split(b"\r\n", 1)[0].decode(errors="replace"))
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\nUpgrade: websocket\r\n"
+                   f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise ConnectionError("DevTools closed the connection during the handshake")
+            resp += chunk
+        if b" 101 " not in resp.split(b"\r\n", 1)[0]:
+            raise ConnectionError(resp.split(b"\r\n", 1)[0].decode(errors="replace"))
+    except BaseException:
+        s.close()
+        raise
     return s
 
 
@@ -103,10 +107,13 @@ def ws_recv(s):
 
 
 def evaluate(expression):
-    targets = json.load(urllib.request.urlopen(DEVTOOLS, timeout=5))
+    with urllib.request.urlopen(DEVTOOLS, timeout=5) as r:
+        targets = json.load(r)
     target = next((t for t in targets if t.get("title") == "SharedJSContext"), None)
     if not target:
         raise SystemExit("Steam's SharedJSContext page was not found (is Steam running?)")
+    if not target.get("webSocketDebuggerUrl"):  # left out while another debugger holds the page
+        raise ConnectionError("Steam's DevTools page is busy")
     s = ws_connect(target["webSocketDebuggerUrl"])
     try:
         ws_send(s, json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
@@ -162,7 +169,7 @@ def add():
         result = json.loads(evaluate(js))
     except (OSError, ValueError) as e:
         raise SystemExit(f"Steam library shortcut not added ({e}). Add it by hand: in Desktop mode open Steam, "
-                         f"Games > Add a Non-Steam Game > Browse > {EXE}")
+                         f"Games > Add a Non-Steam Game > Browse > {EXE}") from e
     print("shortcut:", result)
     set_artwork(result["appid"])
 
@@ -202,6 +209,18 @@ def install_desktop_entry():
 
 
 def remove():
+    """Removes the app-menu entry and icon first (they don't need Steam, so they go even when Steam
+    can't be reached), then the Steam library shortcut."""
+    for app_id in (APP_ID, *OLD_APP_IDS):
+        for path in (os.path.expanduser(f"~/.local/share/applications/{app_id}.desktop"),
+                     os.path.expanduser(f"~/.local/share/icons/hicolor/256x256/apps/{app_id}.png")):
+            try:
+                os.remove(path)
+                print(f"removed {path}")
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"couldn't remove {path}: {e}", file=sys.stderr)
     js = f"""
 (async () => {{
   {FIND}
@@ -211,11 +230,10 @@ def remove():
   return "removed " + found.appid;
 }})()
 """
-    print(evaluate(js))
-    for path in (DESKTOP_FILE, THEME_ICON):
-        if os.path.exists(path):
-            os.remove(path)
-            print(f"removed {path}")
+    try:
+        print(evaluate(js))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"Steam library shortcut not removed ({e}): remove it from the library by hand") from e
 
 
 if __name__ == "__main__":

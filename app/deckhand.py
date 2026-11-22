@@ -15,22 +15,26 @@ Uses only what SteamOS ships: Python 3 and GTK 3 (through PyGObject).
 Run it from the Steam library (works in VR), or with --snapshot PREFIX to
 render every page off-screen into PREFIX-<n>.png (for testing).
 """
+import hashlib
 import html
 import json
 import math
 import os
+import queue
 import re
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GLib, GObject, Gtk, Pango  # noqa: E402
 
 # Window class "deckhand" (instead of "frame_settings.py") so taskbars match
 # the window to frame-settings.desktop (StartupWMClass) and show its icon.
@@ -96,27 +100,44 @@ def run(cmd, timeout=10, env=None):
 
 
 def vr_tool_env():
-    """Environment for SteamVR command-line tools (vrcmd, reclinectl).
-
-    Launched from Steam, this app carries SteamAppId/SteamGameId; a tool that
-    inherits them connects to SteamVR *as this app*, and SteamVR then reloads
-    the app's controller input on every call, which froze the window. A plain
-    environment makes them ordinary background tools.
-    """
-    keep = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "XDG_RUNTIME_DIR")
-    return {k: os.environ[k] for k in keep if k in os.environ}
+    """Environment for SteamVR command-line tools (see paths.clean_env)."""
+    return paths.clean_env()
 
 
 # ---------------------------------------------------------------- fan ---
+_HWMON = None
+
+
 def fan_hwmon():
+    """The fan's hwmon folder (looked up once; again only if it disappears)."""
+    global _HWMON
+    if _HWMON and os.path.isdir(_HWMON):
+        return _HWMON
     base = "/sys/class/hwmon"
     try:
         for name in os.listdir(base):
             if read(os.path.join(base, name, "name")) == FAN_HWMON_NAME:
-                return os.path.join(base, name)
+                _HWMON = os.path.join(base, name)
+                return _HWMON
     except OSError:
         pass
     return None
+
+
+def fan_controller_outdated():
+    """True when a custom fan setting runs a copy of Valve's fan controller that a SteamOS update has
+    since replaced (applying the setting again copies the new one)."""
+    if not os.path.exists(QUIET_DROPIN):
+        return False
+    for name in ("fancontrol.py", "PID.py"):
+        try:
+            with open(os.path.join("/usr/share/deckard-fan-control", name), "rb") as a, \
+                    open(os.path.join(os.path.dirname(QUIET_CFG), name), "rb") as b:
+                if a.read() != b.read():
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def fan_mode():
@@ -136,19 +157,19 @@ def fan_mode():
 
 
 def battery():
-    """(percent or None, charging bool)"""
-    pct, chg = None, False
+    """(percent or None, charging bool) of the headset's own battery. Batteries of peripherals
+    (scope "Device", e.g. controllers) are ignored."""
     try:
-        names = os.listdir("/sys/class/power_supply")
+        names = sorted(os.listdir("/sys/class/power_supply"))
     except OSError:
         return None, False
     for n in names:
         p = f"/sys/class/power_supply/{n}"
-        if read(f"{p}/type") == "Battery" and read(f"{p}/capacity", "").isdigit():
-            pct = int(read(f"{p}/capacity"))
-        if read(f"{p}/status") == "Charging":
-            chg = True
-    return pct, chg
+        if read(f"{p}/type") != "Battery" or read(f"{p}/scope") == "Device":
+            continue
+        cap = read(f"{p}/capacity", "")
+        return (int(cap) if cap.isdigit() else None), read(f"{p}/status") == "Charging"
+    return None, False
 
 
 def fan_log_temps():
@@ -180,10 +201,11 @@ def fan_log_temps():
     return hottest("C"), hottest("G")
 
 
-def fan_status():
+def fan_status(temps=True):
+    """Fan speed, battery and (temps=True: from the fan log) the hottest CPU / GPU temperature."""
     h = fan_hwmon()
     rpm = read(os.path.join(h, "fan1_input")) if h else None
-    cpu, gpu = fan_log_temps()
+    cpu, gpu = fan_log_temps() if temps else (None, None)
     pct, chg = battery()
     return {"rpm": int(rpm) if rpm and rpm.isdigit() else None,
             "cpu": cpu, "gpu": gpu, "battery": pct, "charging": chg}
@@ -281,11 +303,17 @@ def vr_set(section, key, kind, value):
             time.sleep(0.1)
     else:
         path = vrsettings_path()
+        if not path:
+            return False
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-        except (OSError, ValueError):
+        except FileNotFoundError:
             data = {}
+        except (OSError, ValueError):
+            return False  # unreadable or half-written: never replace the user's whole SteamVR settings
+        if not isinstance(data, dict) or not isinstance(data.get(section, {}), dict):
+            return False
         data.setdefault(section, {})[key] = {"bool": bool, "int": int, "float": float}[kind](value)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -325,7 +353,7 @@ def ip_addresses():
 # ----------------------------------------------------------------- UI ---
 # Big, phone-style layout for reading and pointing in VR: full screen,
 # side navigation, cards, large buttons and switches, no dropdowns or pop-ups.
-from gi.repository import Gdk, GdkPixbuf, Pango  # noqa: E402
+from gi.repository import GdkPixbuf  # noqa: E402
 
 ACCENT = "#66ccff"
 CSS = f"""
@@ -397,6 +425,8 @@ def label(text="", css=None, wrap=False, markup=False, selectable=False, xalign=
     lab = Gtk.Label(xalign=xalign)
     lab.set_markup(text) if markup else lab.set_text(text)
     lab.set_line_wrap(wrap)
+    if wrap:  # break long words too, so a long name can never push the window past the screen
+        lab.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
     lab.set_selectable(selectable)
     for c in (css or "").split():
         lab.get_style_context().add_class(c)
@@ -454,6 +484,26 @@ def set_result(lab, text, ok):
     lab.set_text(text)
 
 
+def set_info(lab, text):
+    """Plain (neither good nor bad) text on a label that set_result() may have coloured before."""
+    ctx = lab.get_style_context()
+    ctx.remove_class("ok")
+    ctx.remove_class("err")
+    lab.set_text(text)
+
+
+def safe(fn):
+    """Wraps a GLib timeout/idle callback: an exception is printed instead of silently removing the
+    callback (PyGObject drops a callback that raises, which froze the live readouts for good)."""
+    def run_safely(*args):
+        try:
+            return fn(*args)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            return True
+    return run_safely
+
+
 def in_background(work, done):
     """Runs work() off the UI thread, then done(result) on it."""
     def runner():
@@ -463,6 +513,45 @@ def in_background(work, done):
             result = e
         GLib.idle_add(lambda: (done(result), False)[1])
     threading.Thread(target=runner, daemon=True).start()
+
+
+class SerialJobs:
+    """One background thread running jobs in the order given (systemd changes that must not overlap
+    or finish out of order), then done(result) on the UI thread, like in_background()."""
+
+    def __init__(self):
+        self.q = queue.Queue()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def put(self, work, done=None):
+        self.q.put((work, done))
+
+    def _loop(self):
+        while True:
+            work, done = self.q.get()
+            try:
+                result = work()
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                result = e
+            if done:
+                GLib.idle_add(lambda d=done, r=result: (d(r), False)[1])
+
+
+def user_systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=30)
+
+
+def dbm_text(s):
+    """A reading's strength as a short number ("-52"), or "--" without one."""
+    return f"{s['dbm']:.0f}" if s and s.get("dbm") is not None else "--"
+
+
+def tracking_note(rec):
+    """What a mapping progress line adds when positions aren't coming in."""
+    if rec.pose:
+        return ""
+    return " · tracking stopped: is SteamVR running?" if rec.ended else " · headset not tracking: put it on"
 
 
 def switch_row(title, desc_label, switch):
@@ -541,6 +630,8 @@ class Stepper(Gtk.Box):
             self.scale.add_mark(v, Gtk.PositionType.BOTTOM, t)
         if on_change:
             self.scale.connect("button-release-event", lambda *_: (on_change(), False)[1])
+        # A scroll over the slider would change it without applying it: let the page scroll instead.
+        self.scale.connect("scroll-event", self._pass_scroll)
         self.value_lbl = label("", "card-title", xalign=1.0)
         self.value_lbl.set_width_chars(4)
         adj.connect("value-changed", lambda a: self.value_lbl.set_text(f"{a.get_value():.0f}"))
@@ -554,6 +645,11 @@ class Stepper(Gtk.Box):
         self.adj.set_value(self.adj.get_value() + direction * self.step)
         if self.on_change:
             self.on_change()
+
+    @staticmethod
+    def _pass_scroll(scale, _event):
+        GObject.signal_stop_emission_by_name(scale, "scroll-event")
+        return False
 
 
 class Spin(Gtk.Box):
@@ -590,28 +686,47 @@ class Spin(Gtk.Box):
 
 
 class ConfirmButton(Gtk.Button):
-    """Tap once to arm, tap again within 5 s to do it (no small pop-up dialogs)."""
+    """Tap once to arm, tap again within 5 s to do it (no small pop-up dialogs). The text wraps,
+    so the longer "tap again" text can never make the window wider than the screen."""
 
     def __init__(self, text, armed_text, action, css="danger"):
-        super().__init__(label=text)
+        super().__init__()
         self.text, self.armed_text, self.action = text, armed_text, action
+        self.lbl = label(text, wrap=True, xalign=0.5)
+        self.lbl.set_justify(Gtk.Justification.CENTER)
+        self.add(self.lbl)
         add_class(self, css)
-        self.armed_until = 0
+        self.armed_until = 0.0
+        self._timer = None
         self.connect("clicked", self._clicked)
 
+    def set_text(self, text):
+        self.text = text
+        if not self.armed_until:
+            self.lbl.set_text(text)
+
     def _clicked(self, *_):
-        if time.time() < self.armed_until:
+        if time.monotonic() < self.armed_until:
             self.disarm()
             self.action()
             return
-        self.armed_until = time.time() + 5
-        self.set_label(self.armed_text)
+        self.armed_until = time.monotonic() + 5
+        self.lbl.set_text(self.armed_text)
         add_class(self, "armed")
-        GLib.timeout_add(5000, self.disarm)
+        if self._timer:
+            GLib.source_remove(self._timer)
+        self._timer = GLib.timeout_add(5000, self._expired)
+
+    def _expired(self):
+        self._timer = None  # this timer ends by returning False
+        return self.disarm()
 
     def disarm(self):
-        self.armed_until = 0
-        self.set_label(self.text)
+        if self._timer:
+            GLib.source_remove(self._timer)
+            self._timer = None
+        self.armed_until = 0.0
+        self.lbl.set_text(self.text)
         self.get_style_context().remove_class("armed")
         return False
 
@@ -647,6 +762,7 @@ class HoldButton(Gtk.Box):
             self.started = None
             self.button.set_label("Done")
             self.action()
+            GLib.timeout_add(2500, self._reset)
             return False
         self.button.set_label(f"Keep holding… {self.seconds - held:.1f} s")
         return True
@@ -654,6 +770,12 @@ class HoldButton(Gtk.Box):
     def _cancel(self, *_):
         if self.started is not None:
             self.started = None
+            self.bar.set_fraction(0)
+            self.button.set_label(self.text)
+        return False
+
+    def _reset(self):
+        if self.started is None:
             self.bar.set_fraction(0)
             self.button.set_label(self.text)
         return False
@@ -673,6 +795,7 @@ class HudRenderer:
         self.name.set_max_width_chars(22)
         self.big = None
         self.style = None
+        self.last = None
         self.hud.pack_start(self.name, False, False, 0)
         self.off.add(self.hud)
         self.off.show_all()
@@ -682,8 +805,9 @@ class HudRenderer:
         self.off.destroy()
 
     def _settle(self, rounds=1):
-        for i in range(rounds):
-            self.off.queue_resize() if rounds > 1 else None
+        for _ in range(rounds):
+            if rounds > 1:
+                self.off.queue_resize()
             self.off.queue_draw()
             while Gtk.events_pending():
                 Gtk.main_iteration_do(False)
@@ -693,6 +817,9 @@ class HudRenderer:
                 time.sleep(0.01)
 
     def render(self, title, big, path, done=False):
+        if self.last == (title, big, path, done) and os.path.exists(path):
+            return  # same picture as last time: nothing to draw or write
+        self.last = (title, big, path, done)
         self.name.set_text(title)
         long_text = len(big) > 10  # a reminder's own words: smaller and wrapped
         style = "hud-note" if long_text else "hud-done" if done else "hud-time"
@@ -745,8 +872,11 @@ class FrameSettings(Gtk.Window):
         self.busy = False
         self.loading = False
         self.focused = True
-        self.setup_version = helper_version()
+        self.setup_version = None  # not known yet: asked in the background (sudo can be slow)
         self.setup_poll_until = 0.0
+        self._setup_query = False
+        self.jobs = SerialJobs()   # systemd changes, in order, off the UI thread
+        self._live_hud = None      # renderer of the in-view readout while mapping
 
         self.content = add_class(Gtk.Box(), "root")
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=120)
@@ -773,22 +903,35 @@ class FrameSettings(Gtk.Window):
         self.refresh_power()
         self.refresh_live()
         self.show_page("Fan")
-        if "--snapshot" not in sys.argv:  # background services follow this copy of the app
-            in_background(updater.migrate_units, lambda _r: None)
+        self.check_setup()
+        if "--snapshot" not in sys.argv:
+            # A readout or mini-map left in view by an earlier run that didn't close cleanly
+            subprocess.run(["systemctl", "--user", "stop", "--no-block", self.WIFI_HUD_UNIT, self.MINIMAP_UNIT],
+                           capture_output=True)
+            in_background(updater.migrate_units, lambda _r: None)  # background services follow this copy
+            if not offscreen:  # Steam's "Exit game", logout, Ctrl+C: close properly (stops readouts)
+                for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                    GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, lambda *_: (self.destroy(), False)[1])
         # Light on battery: live numbers every 3 s, the timer clock every 1 s only while its page
         # shows, and nothing at all while the window isn't focused (refreshed again on return).
         self.connect("focus-out-event", self.on_focus_change, False)
         self.connect("focus-in-event", self.on_focus_change, True)
-        GLib.timeout_add_seconds(3, self.refresh_live)
-        GLib.timeout_add(1000, self.tick_timer)
+        GLib.timeout_add_seconds(3, safe(self.refresh_live))
+        GLib.timeout_add_seconds(1, safe(self.tick_timer))  # _seconds: wake-ups line up with others
 
     def on_close(self, *_):
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
         if getattr(self, "wifi_rec", None):  # don't leave the in-view readout or tracking running
             self.stop_wifi_mapping()
         if getattr(self, "house_rec", None):
             self.stop_house_walk()
         if getattr(self, "house_watch", None):
             self.house_watch_stop()
+        # The readouts also end by themselves once this process is gone (they watch its PID).
+        subprocess.run(["systemctl", "--user", "stop", "--no-block", self.WIFI_HUD_UNIT, self.MINIMAP_UNIT],
+                       capture_output=True)
         Gtk.main_quit()
 
     def on_focus_change(self, _w, _ev, focused):
@@ -796,6 +939,8 @@ class FrameSettings(Gtk.Window):
         if focused:
             self.refresh_live()
             self.show_page(self.stack.get_visible_child_name())
+        elif getattr(self, "house_watch", None):
+            self.house_watch_stop()  # nobody is looking at the house map: stop following the headset
         return False
 
     # ============================================================== rail
@@ -834,13 +979,14 @@ class FrameSettings(Gtk.Window):
         for n, b in self.nav.items():
             ctx = b.get_style_context()
             (ctx.add_class if n == nav_name else ctx.remove_class)("active")
-        {"Power": self.refresh_power, "Comfort": self.refresh_comfort,
+        {"Fan": self.refresh_live, "Power": self.refresh_power, "Comfort": self.refresh_comfort,
          "Recline": self.refresh_recline,
          "Timer": self.tick_timer, "Rooms": self.refresh_rooms,
          "System": lambda: (self.refresh_system(), self.show_restart_if_needed(),
                             None if self.upd_checked else self.on_update_check()),
          "Reminders": self.refresh_reminders, "Signal": self.refresh_signal,
          "WifiMap": lambda: self.refresh_wifi(full=True), "House": lambda: self.refresh_house(full=True),
+         "Ceiling": self.refresh_ceiling_status,
          }.get(name, lambda: None)()
 
     def page(self, title):
@@ -927,7 +1073,23 @@ class FrameSettings(Gtk.Window):
 
     @property
     def setup_ready(self):
-        return self.setup_version >= HELPER_MIN_VERSION
+        return (self.setup_version or 0) >= HELPER_MIN_VERSION
+
+    def check_setup(self):
+        """Asks (in the background) whether the fan helper is set up, then updates the Fan page."""
+        if self._setup_query:
+            return
+        self._setup_query = True
+
+        def done(v):
+            self._setup_query = False
+            was = self.setup_ready
+            self.setup_version = v if isinstance(v, int) else 0
+            self.show_setup(not self.setup_ready)
+            if self.setup_ready and not was and self.setup_poll_until:
+                self.setup_poll_until = 0.0
+                set_result(self.fan_result, "Setup done. Pick a preset.", True)
+        in_background(helper_version, done)
 
     def show_setup(self, visible):
         if self.setup_version == 0:
@@ -956,24 +1118,30 @@ class FrameSettings(Gtk.Window):
         for n, b in self.preset_btns.items():
             ctx = b.get_style_context()
             (ctx.add_class if n == active else ctx.remove_class)("selected")
-        self.show_setup(not self.setup_ready)
+        if self.setup_version is not None:
+            self.show_setup(not self.setup_ready)
+        if mode != "stock" and fan_controller_outdated():
+            set_result(self.fan_result, "SteamOS updated Valve's fan controller since this was set: tap your "
+                                        "preset (or Apply custom) again to use the new one.", False)
 
     def refresh_live(self):
         if not self.focused and time.time() >= self.setup_poll_until:
             return True  # in the background: do nothing until focused again
-        s = fan_status()
+        page = self.stack.get_visible_child_name()
+        s = fan_status(temps=page == "Fan")  # temperatures only show on the Fan page
         self.rpm_lbl.set_text(f"{s['rpm']:,} rpm" if s["rpm"] is not None else "fan: n/a")
         parts = []
         if s["cpu"] is not None:
             parts.append(f"CPU {s['cpu']:.0f} °C")
         if s["gpu"] is not None:
             parts.append(f"GPU {s['gpu']:.0f} °C")
-        bat = f"Battery {s['battery']}%" if s["battery"] is not None else "Battery"
-        parts.append(bat + (" (charging)" if s["charging"] else ""))
-        self.temps_lbl.set_text("   ·   ".join(parts))
-        self.rail_status.set_text(f"{bat}{' (charging)' if s['charging'] else ''}\n"
-                                  f"Fan {s['rpm']:,} rpm" if s["rpm"] is not None else bat)
-        page = self.stack.get_visible_child_name()  # live signal readings, only while their page is open
+        bat = (f"Battery {s['battery']}%" if s["battery"] is not None else "Battery n/a") + \
+            (" (charging)" if s["charging"] else "")
+        parts.append(bat)
+        if page == "Fan":
+            self.temps_lbl.set_text("   ·   ".join(parts))
+        self.rail_status.set_text(bat + (f"\nFan {s['rpm']:,} rpm" if s["rpm"] is not None else ""))
+        # live signal readings, only while their page is open
         if page == "WifiMap" and not (self.wifi_rec and self.wifi_rec.running):
             self.refresh_wifi()
         elif page == "House" and not (self.house_rec and self.house_rec.running):
@@ -983,17 +1151,13 @@ class FrameSettings(Gtk.Window):
         if self.stack.get_visible_child_name() == "Power":
             self.refresh_power_status()
         if not self.setup_ready and time.time() < self.setup_poll_until:
-            self.setup_version = helper_version()
-            if self.setup_ready:
-                self.setup_poll_until = 0.0
-                self.show_setup(False)
-                set_result(self.fan_result, "Setup done. Pick a preset.", True)
+            self.check_setup()  # waiting for the setup terminal to finish
         return True
 
     def apply_fan(self, args, what):
         if self.busy:
             return
-        if not self.setup_ready:
+        if self.setup_version is not None and not self.setup_ready:
             set_result(self.fan_result, "Run the setup first (on the right).", False)
             self.show_setup(True)
             return
@@ -1091,16 +1255,34 @@ class FrameSettings(Gtk.Window):
             self.timer_seg.set_value(None)
         st = power.read_status()
         now = time.time()
-        if now - getattr(self, "_svc_checked", 0) > 15:  # asking systemd launches a process: not every tick
-            self._svc_active = power.service_active()
-            self._svc_checked = now
-        running = self._svc_active
-        lines = ["Auto shut-off: " + ("on duty" if running else "service not running")]
+        if now - getattr(self, "_svc_checked", 0) > 15 and not getattr(self, "_svc_query", False):
+            self._svc_query = True  # asking systemd launches a process: in the background, not every tick
+
+            def got(active):
+                self._svc_query = False
+                self._svc_active = active is True
+                self._svc_checked = time.time()
+                if self.stack.get_visible_child_name() == "Power":
+                    self.refresh_power_status()
+            in_background(power.service_active, got)
+        running = getattr(self, "_svc_active", True)
+        idle = int(cfg.get("idle_off_minutes") or 0) if isinstance(cfg.get("idle_off_minutes"), (int, float)) else 0
+        if not running:
+            lines = ["Auto shut-off: service not running"]
+        elif idle == 0:
+            lines = ["Auto shut-off: off (the sleep timer still works)"]
+        else:
+            lines = [f"Auto shut-off: on, after {idle} min in standby"]
         if running and st:
             if st.get("standby_since"):
                 lines.append(f"Headset in standby for {int((time.time() - st['standby_since']) / 60)} min")
             elif st.get("steamvr"):
                 lines.append("Headset in use")
+            if st.get("held"):
+                lines.append(f"Shut-off is waiting: {st['held']}")
+            elif isinstance(st.get("off_at"), (int, float)) and st["off_at"] > time.time():
+                lines.append(f"Shuts down at {time.strftime('%H:%M', time.localtime(st['off_at']))} "
+                             "if it stays in standby")
         self.power_status_lbl.set_text("\n".join(lines))
 
     def power_change(self, mutate, message):
@@ -1111,13 +1293,17 @@ class FrameSettings(Gtk.Window):
         def done(result):
             ok, out = result if isinstance(result, tuple) else (False, str(result))
             set_result(self.power_result, message if ok else f"Saved, but {out}", ok)
+            self._svc_checked = 0  # ask systemd again: it may have just started
             self.refresh_power_status()
         in_background(power.ensure_service, done)
 
     def do_shutdown(self):
         set_result(self.power_result, "Shutting down…", True)
-        in_background(lambda: power.shutdown("Shut down now (Deckhand)"),
-                      lambda _r: set_result(self.power_result, "Shutdown failed: see power.log", False))
+        def done(r):
+            ok = r is True or (isinstance(r, tuple) and r and r[0] is True)
+            if not ok:
+                set_result(self.power_result, "Shutdown failed: see logs/power.log", False)
+        in_background(lambda: power.shutdown("Shut down now (Deckhand)"), done)
 
     def on_timer_pick(self, m):
         deadline = time.time() + m * 60
@@ -1236,6 +1422,7 @@ class FrameSettings(Gtk.Window):
         btns.pack_start(cancel, False, False, 0)
         preview = Gtk.Button(label="Preview popup (10 s)")
         preview.connect("clicked", lambda *_: self.start_kitchen_timer(10, preview=True))
+        self._replace_timer_until = 0.0
         btns.pack_start(preview, False, False, 0)
         right.pack_start(btns, False, False, 0)
         row.pack_start(right, True, True, 0)
@@ -1272,40 +1459,69 @@ class FrameSettings(Gtk.Window):
         return box
 
     def render_timer_images(self, text):
-        """Countdown pictures for the headset popup: 00..60.rgba and done.rgba."""
+        """Countdown pictures for the headset popup: 00..60.rgba and done.rgba. They only change
+        with the timer's name (and the app's look), so they are drawn again only then."""
         out = kitchen_timer.IMG_DIR
+        stamp = hashlib.sha1((text + "\0" + CSS.decode() + "\0" + updater.local_version()).encode()).hexdigest()
+        stamp_file = os.path.join(out, "stamp.txt")
+        files = [f"{s:02d}.rgba" for s in range(61)] + ["done.rgba"]
+        if read(stamp_file) == stamp and all(os.path.exists(os.path.join(out, f)) for f in files):
+            return
         os.makedirs(out, exist_ok=True)
         for f in os.listdir(out):
-            if f.endswith((".png", ".rgba")):
+            if f.endswith((".png", ".rgba", ".txt")):
                 os.remove(os.path.join(out, f))
         with HudRenderer() as r:
-            for s in range(61):
-                r.render(text, f"{s // 60}:{s % 60:02d}", os.path.join(out, f"{s:02d}.rgba"))
+            for sec in range(61):
+                r.render(text, f"{sec // 60}:{sec % 60:02d}", os.path.join(out, f"{sec:02d}.rgba"))
             r.render(text, "Time's up!", os.path.join(out, "done.rgba"), done=True)
+        with open(stamp_file, "w", encoding="utf-8") as f:
+            f.write(stamp)
 
     def start_kitchen_timer(self, seconds, preview=False):
+        if getattr(self, "_timer_busy", False):
+            return  # a double tap: the first one is still starting
+        running = kitchen_timer.status()
+        if running and running["end"] > time.time():
+            if preview:
+                set_result(self.timer_result, "A timer is running: the preview would replace it. "
+                                              "Cancel the timer first.", False)
+                return
+            if time.monotonic() > self._replace_timer_until:  # one mis-aimed tap mustn't replace it
+                self._replace_timer_until = time.monotonic() + 5
+                set_result(self.timer_result, f"{running['label']} is still running: tap again within 5 s "
+                                              "to replace it.", False)
+                return
+        self._replace_timer_until = 0.0
         what = self.timer_name.get_text().strip() or self.timer_label_seg.value or "Timer"
-        set_result(self.timer_result, "Getting the popup ready…", True)
-        while Gtk.events_pending():
-            Gtk.main_iteration_do(False)
+        set_info(self.timer_result, "Getting the popup ready…")
         try:
             self.render_timer_images(what)
         except Exception as e:  # noqa: BLE001
             set_result(self.timer_result, f"Couldn't draw the popup: {e}", False)
             return
-        ok, msg = kitchen_timer.start(seconds, what)
-        if ok:
-            end = time.strftime("%H:%M", time.localtime(time.time() + seconds))
-            set_result(self.timer_result, "Preview: the popup shows in your view now and rings at zero." if preview
-                       else f"{what} timer set for {seconds // 60} min (rings at {end}).", True)
-        else:
-            set_result(self.timer_result, f"Couldn't start the timer: {msg}", False)
-        self.tick_timer()
+        self._timer_busy = True
+
+        def done(result):
+            self._timer_busy = False
+            ok, msg = result if isinstance(result, tuple) else (False, str(result))
+            if ok:
+                end = time.strftime("%H:%M", time.localtime(time.time() + seconds))
+                set_result(self.timer_result, "Preview: the popup shows in your view now and rings at zero."
+                           if preview else f"{what} timer set for {seconds // 60} min (rings at {end}).", True)
+            else:
+                set_result(self.timer_result, f"Couldn't start the timer: {msg}", False)
+            self.tick_timer()
+        # stopping a running timer waits for its popup to close (about a second): not on the UI thread
+        in_background(lambda: kitchen_timer.start(seconds, what), done)
 
     def on_kitchen_cancel(self, *_):
-        kitchen_timer.cancel()
-        set_result(self.timer_result, "Timer cancelled.", True)
-        self.tick_timer()
+        set_info(self.timer_result, "Cancelling…")
+
+        def done(_r):
+            set_result(self.timer_result, "Timer cancelled.", True)
+            self.tick_timer()
+        in_background(kitchen_timer.cancel, done)
 
     def tick_timer(self):
         if not self.focused or self.stack.get_visible_child_name() != "Timer":
@@ -1336,6 +1552,7 @@ class FrameSettings(Gtk.Window):
                                          for d in range(2, 7)]
         self.rem_day_seg = Segmented(list(enumerate(names)), lambda d: self.rem_day.set(d, notify=True),
                                      per_row=4)
+        self._rem_date = today
         when_card.pack_start(self.rem_day_seg, False, False, 0)
         self.rem_day = Spin(0, 365, 1, 0, wrap=False, width_chars=11,
                             fmt=lambda d: (datetime.date.today() + datetime.timedelta(days=d)).strftime("%a, %b %d"),
@@ -1363,7 +1580,7 @@ class FrameSettings(Gtk.Window):
                                        per_row=3)
         self.rem_label_seg.set_value("Reminder")
         what.pack_start(self.rem_label_seg, False, False, 0)
-        self.rem_entry = Gtk.Entry(placeholder_text="…or type your own")
+        self.rem_entry = Gtk.Entry(placeholder_text="…or type your own", max_length=80)
         self.rem_entry.connect("changed", lambda *_: self.update_rem_summary())
         what.pack_start(self.rem_entry, False, False, 0)
         self.rem_summary = label("", "card-title", wrap=True)
@@ -1371,6 +1588,7 @@ class FrameSettings(Gtk.Window):
         set_btn = add_class(Gtk.Button(label="Set reminder"), "primary")
         set_btn.connect("clicked", self.on_set_reminder)
         what.pack_start(set_btn, False, False, 0)
+        self.rem_set_btn = set_btn
         self.rem_result = label("", "status", wrap=True)
         what.pack_start(self.rem_result, False, False, 0)
         what.pack_start(label("Upcoming", "card-title"), False, False, 0)
@@ -1392,7 +1610,19 @@ class FrameSettings(Gtk.Window):
         return datetime.datetime.combine(day, datetime.time(h, self.rem_min.value))
 
     def rem_text(self):
-        return self.rem_entry.get_text().strip() or self.rem_label_seg.value or "Reminder"
+        typed = " ".join(self.rem_entry.get_text().split())  # pasted newlines/tabs become spaces
+        return typed or self.rem_label_seg.value or "Reminder"
+
+    def rem_new_day(self):
+        """Left open past midnight: "Tomorrow", "Fri 28" and the date shown must move on too."""
+        today = datetime.date.today()
+        if today == getattr(self, "_rem_date", today):
+            return
+        self._rem_date = today
+        names = ["Today", "Tomorrow"] + [(today + datetime.timedelta(days=d)).strftime("%a %d") for d in range(2, 7)]
+        for b, n in zip(self.rem_day_seg.buttons, names):
+            b.set_label(n)
+        self.rem_day.set(self.rem_day.value)
 
     def update_rem_summary(self):
         when = self.rem_when()
@@ -1407,11 +1637,16 @@ class FrameSettings(Gtk.Window):
                                   f"  ({rel})")
 
     def on_set_reminder(self, *_):
+        self.rem_new_day()
         when = self.rem_when()
         epoch = when.timestamp()
         text = self.rem_text()
         if epoch <= time.time():
             set_result(self.rem_result, "That time has already passed; pick a later one.", False)
+            return
+        dup = next((m for m in reminders.upcoming() if abs(m["when"] - epoch) < 30 and m["text"] == text), None)
+        if dup:
+            set_result(self.rem_result, "That reminder is already set.", False)
             return
         rid = reminders.new_id(epoch)
         try:
@@ -1421,12 +1656,18 @@ class FrameSettings(Gtk.Window):
         except Exception as e:  # noqa: BLE001
             set_result(self.rem_result, f"Couldn't draw the popup: {e}", False)
             return
-        ok, msg = reminders.add(rid, epoch, text)
-        set_result(self.rem_result, f"Set: {text}, {when.strftime('%a %b %d, %I:%M %p')}." if ok
-                   else f"Couldn't set it: {msg}", ok)
-        self.refresh_reminders()
+        self.rem_set_btn.set_sensitive(False)  # one tap, one reminder
+
+        def done(result):
+            self.rem_set_btn.set_sensitive(True)
+            ok, msg = result if isinstance(result, tuple) else (False, str(result))
+            set_result(self.rem_result, f"Set: {text}, {when.strftime('%a %b %d, %I:%M %p')}." if ok
+                       else f"Couldn't set it: {msg}", ok)
+            self.refresh_reminders()
+        in_background(lambda: reminders.add(rid, epoch, text), done)  # systemctl calls: off the UI thread
 
     def refresh_reminders(self):
+        self.rem_new_day()
         for child in self.rem_list.get_children():
             self.rem_list.remove(child)
         items = reminders.upcoming()
@@ -1446,9 +1687,10 @@ class FrameSettings(Gtk.Window):
         self.update_rem_summary()
 
     def delete_reminder(self, rid):
-        reminders.delete(rid)
-        set_result(self.rem_result, "Reminder deleted.", True)
-        self.refresh_reminders()
+        def done(_r):
+            set_result(self.rem_result, "Reminder deleted.", True)
+            self.refresh_reminders()
+        in_background(lambda: reminders.delete(rid), done)
 
     # ============================================================== rooms
     def build_rooms(self):
@@ -1470,7 +1712,8 @@ class FrameSettings(Gtk.Window):
         self.room_now_lbl = label("", "status", wrap=True)
         right.pack_start(self.room_now_lbl, False, False, 0)
         now_prev = Gtk.Button(label="Preview")
-        now_prev.connect("clicked", lambda *_: self.show_room_preview(rooms.current(), current=True))
+        now_prev.connect("clicked", lambda *_: in_background(
+            rooms.current, lambda m: self.show_room_preview(m if isinstance(m, dict) else {}, current=True)))
         right.pack_start(now_prev, False, False, 0)
         self.undo_btn = ConfirmButton("Undo last load", "Tap again to switch back",
                                       lambda: self.load_room(rooms.BACKUP, "the room before the last load"),
@@ -1480,12 +1723,15 @@ class FrameSettings(Gtk.Window):
         cur.pack_start(crow, False, False, 0)
 
         save = card("Save this room")
-        self.room_name = Gtk.Entry(placeholder_text="Name it, e.g. Bedroom")
+        self.room_name = Gtk.Entry(placeholder_text="Name it, e.g. Bedroom", max_length=40)
         self.room_name.connect("changed", lambda *_: self.reset_save_button())
         save.pack_start(self.room_name, False, False, 0)
         save.pack_start(Segmented([(n, n) for n in rooms.SUGGESTED_NAMES],
                                   lambda n: self.room_name.set_text(n), per_row=3), False, False, 0)
-        self.room_save_btn = add_class(Gtk.Button(label="Save"), "primary")
+        self.room_save_btn = add_class(Gtk.Button(), "primary")
+        self.room_save_lbl = label("Save", wrap=True, xalign=0.5)  # "Tap again to replace '…'" wraps
+        self.room_save_lbl.set_justify(Gtk.Justification.CENTER)
+        self.room_save_btn.add(self.room_save_lbl)
         self.room_save_btn.connect("clicked", self.on_save_room)
         save.pack_start(self.room_save_btn, False, False, 0)
         box.pack_start(self.two_columns(cur, save), False, False, 0)
@@ -1496,6 +1742,8 @@ class FrameSettings(Gtk.Window):
         self.rooms_grid_holder = Gtk.Box()
         box.pack_start(self.rooms_grid_holder, False, False, 0)
         self._replace_armed = (None, 0)
+        self._replace_timer = None
+        self._rooms_seq = 0
         return box
 
     @staticmethod
@@ -1570,6 +1818,7 @@ class FrameSettings(Gtk.Window):
             "link straight from the dongle on your PC (PC VR streaming with the dongle). Map either one.",
             "desc", wrap=True), False, False, 0)
         self.sig_now = {}
+        self._sig_reading, self._sig_done = False, None
         cards_ = []
         for target, title in wifi_map.TARGETS.items():
             c = card(title)
@@ -1593,8 +1842,24 @@ class FrameSettings(Gtk.Window):
         return box
 
     def refresh_signal(self):
-        readings = {"wifi": wifi_map.signal(), "dongle": wifi_map.dongle_signal()}
-        for target, s in readings.items():
+        self.read_signals(self.show_signal_now)
+
+    def read_signals(self, done):
+        """Reads both links off the UI thread (a few `iw` calls), then done(wifi, dongle) on it. One
+        read at a time; the page that asked last gets the result."""
+        self._sig_done = done
+        if self._sig_reading:
+            return
+        self._sig_reading = True
+
+        def finish(result):
+            self._sig_reading = False
+            wifi, dongle = result if isinstance(result, tuple) else (None, None)
+            self._sig_done(wifi, dongle)
+        in_background(lambda: (wifi_map.signal(), wifi_map.dongle_signal()), finish)
+
+    def show_signal_now(self, wifi, dongle):
+        for target, s in (("wifi", wifi), ("dongle", dongle)):
             big, desc = self.sig_now[target]
             if s and s.get("dbm") is not None:
                 word, colour = wifi_map.quality(s["dbm"])
@@ -1607,14 +1872,56 @@ class FrameSettings(Gtk.Window):
                               "The PC's dongle isn't linked right now (PC off or asleep, or Steam closed).")
 
     # ========================================================== wi-fi map
-    WIFI_HUD = os.path.expanduser("~/.cache/frame-settings/wifi-live.rgba")
+    # In-view readouts while mapping: pictures rewritten every second, kept in RAM (no flash wear).
+    WIFI_HUD = os.path.join(paths.runtime_dir(), "wifi-live.rgba")
     WIFI_HUD_UNIT = "frame-wifi-live"
-    MINIMAP = os.path.expanduser("~/.cache/frame-settings/minimap.rgba")
+    MINIMAP = os.path.join(paths.runtime_dir(), "minimap.rgba")
     MINIMAP_UNIT = "frame-minimap"
+
+    def set_readout(self, mode=None):
+        """Which in-view readout runs: None, "--live" (big number) or "--minimap". Each is its own user
+        service that ends with SteamVR (PartOf) and by itself once this window is gone (it watches our
+        PID). Stopping an overlay takes a second or two, so changes run in order in the background."""
+        self._readout_want = mode
+        self.jobs.put(self._apply_readout, self._readout_done)
+
+    def _apply_readout(self):
+        mode = self._readout_want  # the newest wish: older queued jobs all apply the same one
+        units = {"--live": (self.WIFI_HUD_UNIT, self.WIFI_HUD), "--minimap": (self.MINIMAP_UNIT, self.MINIMAP)}
+        unit, path = units.get(mode, (None, None))
+        user_systemctl("stop", *[u for u, _p in units.values() if u != unit])
+        if not unit or user_systemctl("is-active", "--quiet", unit).returncode == 0:
+            return None
+        user_systemctl("reset-failed", unit)
+        r = subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}",
+                            "--property=After=steamvr.service", "--property=PartOf=steamvr.service",
+                            kitchen_timer.BIN, mode, path, str(os.getpid())],
+                           capture_output=True, text=True, timeout=30)
+        return None if r.returncode == 0 else ((r.stderr or r.stdout).strip()[-200:] or "systemd-run failed")
+
+    def _readout_done(self, error):
+        if not error or self._readout_want is None:
+            return
+        where = self.house_progress if (self.house_rec and self.house_rec.running) else self.wifi_progress
+        set_result(where, f"The readout in your view didn't start: {error}", False)
+
+    def live_hud(self):
+        """One renderer for the in-view readout while mapping (a new one every second meant a full
+        layout pass each time)."""
+        if self._live_hud is None:
+            self._live_hud = HudRenderer().__enter__()
+        return self._live_hud
+
+    def close_live_hud(self):
+        if self._live_hud is not None:
+            self._live_hud.__exit__()
+            self._live_hud = None
 
     def build_wifi_page(self):
         self.wifi_rec = None
         self.wifi_target = "wifi"
+        self._wifi_starting = False
+        self._readout_want = None
         box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18), "page")
         head = Gtk.Box(spacing=18)
         back = Gtk.Button(label="‹ Back to Signal")
@@ -1657,15 +1964,28 @@ class FrameSettings(Gtk.Window):
 
     def on_wifi_target(self, target):
         self.wifi_target = target
+        if self.wifi_rec and self.wifi_rec.running:
+            self.render_wifi_hud()  # the readout in view follows the choice at once
         self.refresh_wifi(full=True)
 
     def refresh_wifi(self, full=False):
         rec = self.wifi_rec
-        live = rec and rec.running
-        if self.wifi_target == "wifi":
-            s = rec.latest if live else wifi_map.signal()
-        else:
-            s = rec.latest_dongle if live else wifi_map.dongle_signal()
+        if rec and rec.running:
+            self.show_wifi_now(rec.latest, rec.latest_dongle)
+            m = {"bounds": rec.bounds, "samples": list(rec.samples)}
+            el = int(rec.elapsed())
+            set_info(self.wifi_progress, f"Mapping: {el // 60}:{el % 60:02d} · {len(rec.samples)} readings"
+                     + tracking_note(rec))
+            self.wifi_img.set_from_pixbuf(self.wifi_svg(m, self.wifi_target))
+            return
+        self.read_signals(self.show_wifi_now)
+        if full:
+            m = wifi_map.last_map()
+            self.wifi_img.set_from_pixbuf(self.wifi_svg(m or {}, self.wifi_target))
+            self.show_wifi_result(m)
+
+    def show_wifi_now(self, wifi, dongle):
+        s = wifi if self.wifi_target == "wifi" else dongle
         if s and s.get("dbm") is not None:
             word, colour = wifi_map.quality(s["dbm"])
             self.wifi_now.set_markup(f'<span foreground="{colour}">{s["dbm"]:.0f} dBm</span>')
@@ -1678,17 +1998,6 @@ class FrameSettings(Gtk.Window):
         else:
             self.wifi_now.set_markup('<span foreground="#8a96a3">No dongle</span>')
             self.wifi_now_desc.set_text("The PC's dongle isn't linked right now (PC off or asleep, or Steam closed).")
-        if live:
-            m = {"bounds": rec.bounds, "samples": list(rec.samples)}
-            el = int(rec.elapsed())
-            self.wifi_progress.set_text(f"Mapping: {el // 60}:{el % 60:02d} · {len(rec.samples)} readings"
-                                        + ("" if rec.pose else " · headset not tracking: put it on"))
-            self.wifi_img.set_from_pixbuf(self.wifi_svg(m, self.wifi_target))
-            return
-        if full:
-            m = wifi_map.last_map()
-            self.wifi_img.set_from_pixbuf(self.wifi_svg(m or {}, self.wifi_target))
-            self.show_wifi_result(m)
 
     def show_wifi_result(self, m):
         if not m:
@@ -1712,78 +2021,94 @@ class FrameSettings(Gtk.Window):
         if self.wifi_rec and self.wifi_rec.running:
             self.stop_wifi_mapping()
             return
-        rec = wifi_map.Recorder()
-        try:
-            rec.start()
-        except Exception as e:  # noqa: BLE001
-            set_result(self.wifi_progress, f"Couldn't start: {e}", False)
+        if (self.house_rec and self.house_rec.running) or self._house_starting:
+            set_result(self.wifi_progress, "Stop the whole-house walk first.", False)
             return
-        self.wifi_rec = rec
-        self.wifi_btn.set_label("Stop mapping")
+        if self._wifi_starting:
+            return
+        self._wifi_starting = True
+        self.wifi_btn.set_sensitive(False)
         self.wifi_result.set_text("")
-        self.render_wifi_hud()
-        subprocess.run(["systemctl", "--user", "stop", self.WIFI_HUD_UNIT], capture_output=True)
-        subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.WIFI_HUD_UNIT}",
-                        kitchen_timer.BIN, "--live", self.WIFI_HUD], capture_output=True)
-        GLib.timeout_add(1000, self.tick_wifi)
+        set_info(self.wifi_progress, "Starting…")
+        rec = wifi_map.Recorder()
+
+        def started(result):
+            self._wifi_starting = False
+            self.wifi_btn.set_sensitive(True)
+            if isinstance(result, Exception):
+                set_result(self.wifi_progress, f"Couldn't start: {result}", False)
+                return
+            if getattr(self, "_closing", False):
+                rec.stop()
+                return
+            self.wifi_rec = rec
+            self.wifi_btn.set_label("Stop mapping")
+            set_info(self.wifi_progress, "Mapping: walk slowly around your play space.")
+            self.render_wifi_hud()
+            self.set_readout("--live")
+            GLib.timeout_add(1000, safe(self.tick_wifi), rec)
+        in_background(rec.start, started)  # reads the boundary from SteamVR: a second or two
 
     def on_wifi_clear(self):
         if self.wifi_rec and self.wifi_rec.running:
             self.stop_wifi_mapping()
         wifi_map.clear()
-        self.wifi_progress.set_text("Cleared. Press Start mapping to map from scratch.")
+        set_info(self.wifi_progress, "Cleared. Press Start mapping to map from scratch.")
         self.wifi_img.set_from_pixbuf(self.wifi_svg({}, self.wifi_target))
         self.show_wifi_result(None)
 
-    def tick_wifi(self):
-        rec = self.wifi_rec
-        if not rec:
-            return False
+    def tick_wifi(self, rec):
+        if rec is not self.wifi_rec:
+            return False  # that mapping session is over
         if not rec.running:  # stopped by itself (5 min)
             self.stop_wifi_mapping()
             return False
         self.render_wifi_hud()
-        if self.stack.get_visible_child_name() == "WifiMap":
+        if self.focused and self.stack.get_visible_child_name() == "WifiMap":
             self.refresh_wifi()
         return True
 
     def render_wifi_hud(self):
+        """The readout in your view: the chosen link's strength, big (titles stay short: the popup
+        shortens anything over about 22 characters)."""
         rec = self.wifi_rec
         dongle = self.wifi_target == "dongle"
         s = (rec.latest_dongle if dongle else rec.latest) if rec else None
-        other = (rec.latest if dongle else rec.latest_dongle) if rec else None
         name = "Dongle" if dongle else "Wi-Fi"
-        other_txt = (f"{'Wi-Fi' if dongle else 'Dongle'} {other['dbm']:.0f}"
-                     if other and other.get("dbm") is not None else "")
         if s and s.get("dbm") is not None:
-            word = wifi_map.quality(s["dbm"])[0]
-            title = f"{name} {word} · {s.get('tx') or 0:.0f} Mbit/s" + (f" · {other_txt}" if other_txt else "")
-            big = f"{s['dbm']:.0f} dBm"
+            title, big = f"{name} · {wifi_map.quality(s['dbm'])[0]}", f"{s['dbm']:.0f} dBm"
         else:
-            title, big = f"{name} map" + (f" · {other_txt}" if other_txt else ""), "…"
-        os.makedirs(os.path.dirname(self.WIFI_HUD), exist_ok=True)
+            title, big = f"{name} map", "…"
         try:
-            with HudRenderer() as r:
-                r.render(title, big, self.WIFI_HUD)
+            self.live_hud().render(title, big, self.WIFI_HUD)
         except Exception:  # noqa: BLE001
-            pass
+            traceback.print_exc()
 
     def stop_wifi_mapping(self):
         rec, self.wifi_rec = self.wifi_rec, None
-        subprocess.run(["systemctl", "--user", "stop", self.WIFI_HUD_UNIT], capture_output=True)
+        self.set_readout(None)
+        self.close_live_hud()
         self.wifi_btn.set_label("Start mapping")
         if not rec:
             return
         m = rec.stop()
         n = len(m.get("samples", []))
-        self.wifi_progress.set_text(f"Done: {n} readings in {m.get('cells', 0)} spots." if n else
-                                    "No readings: the headset wasn't tracking. Wear it while you walk.")
+        spots = ((m.get("links") or {}).get(self.wifi_target) or {}).get("cells", 0)
+        if not n:
+            set_result(self.wifi_progress, "No readings: tracking stopped (is SteamVR running?)." if rec.ended
+                       else "No readings: the headset wasn't tracking. Wear it while you walk.", False)
+        elif spots:
+            set_result(self.wifi_progress, f"Done: {n} readings in {spots} spots.", True)
+        else:
+            set_result(self.wifi_progress, f"Done: {n} readings, none of them {wifi_map.TARGETS[self.wifi_target]}: "
+                                           "show the other link above.", True)
         self.wifi_img.set_from_pixbuf(self.wifi_svg(m, self.wifi_target))
         self.show_wifi_result(m)
 
     @staticmethod
     def wifi_svg(m, target="wifi", w=880, h=700):
-        """Heatmap of one link's strength over the boundary: 0.5 m squares, green strong → red weak."""
+        """Heatmap of one link's strength over the boundary: 0.5 m squares on the colour-blind safe
+        scale (bright yellow strong → dark purple weak)."""
         bounds = m.get("bounds") or []
         cells = wifi_map.grid(m.get("samples") or [], target)
         bg = "#141b24"
@@ -1840,6 +2165,15 @@ class FrameSettings(Gtk.Window):
     def build_house_page(self):
         self.house_rec = None
         self.house_watch = None   # PoseWatcher while the page is open and no walk runs
+        self._house_starting = False
+        self._watch_started = 0.0
+        self._house_ticks = 0
+        self._you_floor = None    # the floor you were last seen on while walking
+        self._you_drawn = None    # where the "You" marker was last drawn (x, z, heading°)
+        self._floors_shown = None
+        self.floor_seg = None
+        self._inspect = None
+        recovered = house_map.recover() if "--snapshot" not in sys.argv else 0  # a walk cut short last time
         self.house_m = house_map.load()
         self.house_floor = 0
         self.house_target = "wifi"
@@ -1889,8 +2223,8 @@ class FrameSettings(Gtk.Window):
         ev.connect("realize", lambda *_: self.set_map_cursor())
         left.pack_start(ev, False, False, 0)
         view = Gtk.Box(spacing=8, homogeneous=True)  # view buttons: rotate, zoom, find me, reset
-        for icons, text, act in ((["object-rotate-left"], "Left", lambda: self.map_view(angle=-15)),
-                                 (["object-rotate-right"], "Right", lambda: self.map_view(angle=15)),
+        for icons, text, act in ((["object-rotate-left"], "Left", lambda: self.map_rotate(-15)),
+                                 (["object-rotate-right"], "Right", lambda: self.map_rotate(15)),
                                  (["zoom-out"], "Out", lambda: self.map_zoom_at(None, 1 / 1.4)),
                                  (["zoom-in"], "In", lambda: self.map_zoom_at(None, 1.4)),
                                  (["find-location", "mark-location"], "Me", self.map_center_me),
@@ -1929,8 +2263,9 @@ class FrameSettings(Gtk.Window):
                                                              "in a game; turns with you.", "desc", wrap=True),
                                    self.minimap_switch), False, False, 0)
         self.house_progress = label(
-            "Walk every room with the headset on (passthrough helps). Wi-Fi and the Steam dongle are "
-            "both measured. Walks add up; Clear map starts fresh.", "desc", wrap=True)
+            f"Recovered a walk that was cut short ({recovered} positions) and added it to the map." if recovered
+            else "Walk every room with the headset on (passthrough helps). Wi-Fi and the Steam dongle are "
+                 "both measured. Walks add up; Clear map starts fresh.", "desc", wrap=True)
         side.pack_start(self.house_progress, False, False, 0)
         self.house_result = label("", "status", wrap=True)
         side.pack_start(self.house_result, False, False, 0)
@@ -1972,11 +2307,20 @@ class FrameSettings(Gtk.Window):
 
     def house_watch_start(self):
         """Follows the headset for the "You" marker while this page is open (a walk does it itself)."""
-        if self.house_watch or (self.house_rec and self.house_rec.running) or "--snapshot" in sys.argv:
+        if (self.house_rec and self.house_rec.running) or self._house_starting or "--snapshot" in sys.argv:
             return
+        w = self.house_watch
+        if w and w.alive():
+            return
+        if w:  # its tracking tool ended (SteamVR stopped or restarted): try again now and then
+            if time.monotonic() - self._watch_started < 15:
+                return
+            w.stop()
+            self.house_watch = None
+        self._watch_started = time.monotonic()
         try:
             self.house_watch = house_map.PoseWatcher().start()
-        except Exception:  # noqa: BLE001  (no helper / SteamVR not running: just no marker)
+        except Exception:  # noqa: BLE001  (no helper: just no marker)
             self.house_watch = None
 
     def house_watch_stop(self):
@@ -1997,16 +2341,23 @@ class FrameSettings(Gtk.Window):
             self.render_minimap() if self.house_prefs["minimap"] else self.render_house_hud()
         self.refresh_house(full=True)
 
-    def house_live(self):
-        """(home Wi-Fi reading, dongle reading): the recorder's latest while walking, else read now."""
-        rec = self.house_rec
-        if rec and rec.running:
-            return rec.latest, rec.latest_dongle
-        return wifi_map.signal(), house_map.dongle_signal()
-
     def refresh_house(self, full=False):
         rec = self.house_rec
-        wifi, dongle = self.house_live()
+        if rec and rec.running:
+            self.show_house_now(rec.latest, rec.latest_dongle)
+            el = int(rec.elapsed())
+            set_info(self.house_progress, f"Walking: {el // 60}:{el % 60:02d} · {rec.distance:.0f} m · "
+                                          f"{len(rec.samples)} positions" + tracking_note(rec))
+            self.draw_house(house_map.add_walk(self.house_m, rec), follow=True)
+            return
+        self.read_signals(self.show_house_now)
+        self.house_watch_start()
+        if full or self.you_moved():  # the "You" marker moves with you
+            self.draw_house(self.house_m or {})
+        if full:
+            self.show_house_result()
+
+    def show_house_now(self, wifi, dongle):
         sel = wifi if self.house_target == "wifi" else dongle
         if sel and sel.get("dbm") is not None:
             self.house_now.set_markup(f'<span foreground="{wifi_map.quality(sel["dbm"])[1]}">'
@@ -2024,77 +2375,100 @@ class FrameSettings(Gtk.Window):
         self.house_now_desc.set_markup(
             line("Home Wi-Fi", wifi, "not connected") + "\n" +
             line("Steam dongle", dongle, "not connected (PC dongle off or asleep)"))
-        if rec and rec.running:
-            el = int(rec.elapsed())
-            self.house_progress.set_text(f"Walking: {el // 60}:{el % 60:02d} · {rec.distance:.0f} m · "
-                                         f"{len(rec.samples)} readings" +
-                                         ("" if rec.pose else " · headset not tracking: put it on"))
-            self.draw_house(house_map.add_walk(self.copy_house(), rec))
-            return
-        self.house_watch_start()
-        if full or self.house_watch:  # the "You" marker moves with you
-            self.draw_house(self.house_m or {})
-        if full:
-            self.show_house_result()
 
-    def copy_house(self):
-        m = self.house_m
-        if not m:
-            return None
-        return dict(m, samples=list(m.get("samples", [])))
-
-    def draw_house(self, m):
+    def draw_house(self, m, follow=False):
+        """Draws the map. follow=True (while walking): switches to a floor you just walked onto."""
         self._house_drawn = m
         samples = m.get("samples") or []
         fl = house_map.floors(samples) if samples else [0]
+        you = self.house_you()
+        if follow and you and samples:
+            f = house_map.floor_of(you[1], house_map.floor_base(samples))
+            if f != self._you_floor:
+                self._you_floor = f
+                if f in fl and f != self.house_floor:
+                    self.house_floor = f
+                    self._label_sel = self._inspect = None
         if self.house_floor not in fl:
             self.house_floor = fl[0]
-        for child in self.house_floor_box.get_children():
-            self.house_floor_box.remove(child)
-        if len(fl) > 1:
-            seg = Segmented([(f, house_map.floor_name(f)) for f in fl],
-                            lambda f: (setattr(self, "house_floor", f), self.draw_house(m)))
-            seg.set_value(self.house_floor)
-            self.house_floor_box.pack_start(seg, True, True, 0)
-            self.house_floor_box.show_all()
+        self.update_floor_picker(fl)
         tool = getattr(self, "map_tool", "move")
         hint = self.TOOL_HINTS[tool].format(mode={"add": "add a label", "move": "pick a label, then tap where it goes",
                                                   "rename": "rename a label", "delete": "delete a label"}
                                             .get(getattr(self, "label_mode", None) and self.label_mode.value, "label"))
         pix, self._house_xf = self.house_svg(m, self.house_floor, self.house_target,
                                              selected=getattr(self, "_label_sel", None),
-                                             view=self.house_view, you=self.house_you(),
-                                             w=self.MAP_W, h=self.MAP_H, hint=hint,
-                                             inspect=getattr(self, "_inspect", None))
+                                             view=self.house_view, you=you,
+                                             w=self.MAP_W, h=self.MAP_H, hint=hint, inspect=self._inspect)
+        self._you_drawn = self.you_key(you)
         self.house_img.set_from_pixbuf(pix)
 
+    def update_floor_picker(self, fl):
+        """Floor buttons, rebuilt only when the floors change (rebuilding them on every redraw could
+        swallow a tap)."""
+        if fl != self._floors_shown:
+            self._floors_shown = list(fl)
+            for child in self.house_floor_box.get_children():
+                self.house_floor_box.remove(child)
+            self.floor_seg = None
+            if len(fl) > 1:
+                self.floor_seg = Segmented([(f, house_map.floor_name(f)) for f in fl], self.on_house_floor,
+                                           per_row=3)
+                self.house_floor_box.pack_start(self.floor_seg, True, True, 0)
+                self.house_floor_box.show_all()
+        if self.floor_seg and self.floor_seg.value != self.house_floor:
+            self.floor_seg.set_value(self.house_floor)
+
+    def on_house_floor(self, f):
+        self.house_floor = f
+        self._label_sel = self._inspect = None
+        self.redraw_house()
+
+    @staticmethod
+    def you_key(you):
+        return None if not you else (you[0], you[2], math.degrees(math.atan2(you[3][0], you[3][1])))
+
+    def you_moved(self):
+        """True when the "You" marker moved enough (20 cm or 10°) to be worth redrawing the map."""
+        now, last = self.you_key(self.house_you()), self._you_drawn
+        if now is None or last is None:
+            return now != last
+        turned = abs((now[2] - last[2] + 180) % 360 - 180)
+        return math.hypot(now[0] - last[0], now[1] - last[1]) > 0.2 or turned > 10
+
     # ---- map view: rotate / zoom / pan (drag) / center on me / reset
-    def map_view(self, angle=0, zoom=1.0):
-        v = self.house_view
+    def map_rotate(self, angle):
+        """Turns the map. Zoomed in or moved, the spot in the middle stays in the middle."""
+        v, xf = self.house_view, self._house_xf
+        if xf and (v["zoom"] != 1.0 or v["pan"] != [0.0, 0.0]):
+            v["anchor"] = self.house_view_metres(xf, xf["w"] / 2, xf["hm"] / 2)
         v["angle"] = (v["angle"] + angle) % 360
-        v["zoom"] = max(0.4, min(6.0, v["zoom"] * zoom))
-        if zoom != 1.0:  # zoom around the middle of the map
-            k = zoom if 0.4 < v["zoom"] < 6.0 else 1.0
-            v["pan"] = [v["pan"][0] * k, v["pan"][1] * k]
-        if angle:
-            self.house_prefs["angle"] = v["angle"]
-            house_map.save_prefs(self.house_prefs)
+        self.house_prefs["angle"] = v["angle"]
+        house_map.save_prefs(self.house_prefs)
         self.redraw_house()
 
     def map_reset(self):
         self.house_view.update(angle=0.0, zoom=1.0, pan=[0.0, 0.0])
+        self.house_view.pop("anchor", None)
         self._inspect = None
-        self.house_prefs["angle"] = 0
+        self.house_prefs["angle"] = 0.0
         house_map.save_prefs(self.house_prefs)
         self.redraw_house()
 
     def map_center_me(self):
-        you, xf = self.house_you(), self._house_xf
-        if not you or not xf:
-            self.label_status.set_text("Your position isn't known right now (headset not tracking?).")
+        """Centres the map on you (on the floor you're on)."""
+        you = self.house_you()
+        if not you:
+            set_result(self.label_status, "Your position isn't known right now (headset not tracking?).", False)
             return
-        sx, sy = self.house_view_point(xf, you[0], you[2], pan=False)
-        self.house_view["pan"] = [xf["w"] / 2 - sx, xf["hm"] / 2 - sy]
+        m = getattr(self, "_house_drawn", None) or self.house_m or {}
+        samples = m.get("samples") or []
+        if samples:
+            f = house_map.floor_of(you[1], house_map.floor_base(samples))
+            if f != self.house_floor and f in house_map.floors(samples):
+                self.house_floor = f
+                self._label_sel = self._inspect = None
+        self.house_view["anchor"] = (you[0], you[2])
         self.redraw_house()
 
     def redraw_house(self):
@@ -2252,10 +2626,10 @@ class FrameSettings(Gtk.Window):
         bg = "#141b24"
         foot = 96
         hm = h - foot
-        xs = ([(i + d) * house_map.CELL for (i, _j) in walked for d in (0, 1)] + [l["x"] for _i, l in labels] + [0]
-              + ([here[0]] if here else []))
-        zs = ([(j + d) * house_map.CELL for (_i, j) in walked for d in (0, 1)] + [l["z"] for _i, l in labels] + [0]
-              + ([here[2]] if here else []))
+        # The fit covers the walked squares, labels and the start, not you: the map doesn't rescale
+        # as you move (you're kept at its edge when you're off it).
+        xs = [(i + d) * house_map.CELL for (i, _j) in walked for d in (0, 1)] + [l["x"] for _i, l in labels] + [0]
+        zs = [(j + d) * house_map.CELL for (_i, j) in walked for d in (0, 1)] + [l["z"] for _i, l in labels] + [0]
         xf = None
         if not walked:
             svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">'
@@ -2263,15 +2637,21 @@ class FrameSettings(Gtk.Window):
                    f'<text x="{w / 2}" y="{h / 2}" fill="#9fb3c8" font-size="28" text-anchor="middle" '
                    f'font-family="sans-serif">No house map yet: press Start walking</text></svg>')
         else:
-            cx, cz = (min(xs) + max(xs)) / 2, (min(zs) + max(zs)) / 2
             th = math.radians(view["angle"])
             co, si = math.cos(th), math.sin(th)
-            rxs = [(x - cx) * co - (z - cz) * si for x, z in zip(xs, zs)]
-            rzs = [(x - cx) * si + (z - cz) * co for x, z in zip(xs, zs)]
+            rxs = [x * co - z * si for x, z in zip(xs, zs)]  # turned by the view's angle
+            rzs = [x * si + z * co for x, z in zip(xs, zs)]
+            rcx, rcz = (max(rxs) + min(rxs)) / 2, (max(rzs) + min(rzs)) / 2
+            cx, cz = rcx * co + rcz * si, -rcx * si + rcz * co  # the middle of the turned map, in metres
             pad = 30
             fit = min((w - 2 * pad) / (max(rxs) - min(rxs) + 1.0), (hm - 2 * pad) / (max(rzs) - min(rzs) + 1.0))
             s = fit * view["zoom"]
-            xf = {"cx": cx, "cz": cz, "cos": co, "sin": si, "s": s, "pan": list(view["pan"]), "w": w, "hm": hm}
+            xf = {"cx": cx, "cz": cz, "cos": co, "sin": si, "s": s, "pan": [0.0, 0.0], "w": w, "hm": hm}
+            anchor = view.pop("anchor", None)
+            if anchor:  # this spot (metres) goes in the middle: "Me", or keeping the middle while turning
+                ax, ay = FrameSettings.house_view_point(xf, *anchor)
+                view["pan"] = [w / 2 - ax, hm / 2 - ay]
+            xf["pan"] = list(view["pan"])
 
             def P(x, z):
                 return FrameSettings.house_view_point(xf, x, z)
@@ -2314,8 +2694,10 @@ class FrameSettings(Gtk.Window):
                              f'stroke-width="3"/><text x="{lx:.1f}" y="{lz + 32:.1f}" fill="#ffffff" '
                              f'font-size="22" font-weight="bold" text-anchor="middle" font-family="sans-serif" '
                              f'stroke="#0e141b" stroke-width="5" paint-order="stroke">{html.escape(l["name"])}</text>')
-            if here:  # you: a big arrow pointing where you look, with a ring and "You"
-                ux, uz = P(here[0], here[2])
+            if here:  # you: a big arrow pointing where you look, with a ring and "You" (at the edge if
+                ux, uz = P(here[0], here[2])  # you're off the map)
+                off = not (40 <= ux <= w - 40 and 40 <= uz <= hm - 80)
+                ux, uz = min(max(ux, 40), w - 40), min(max(uz, 40), hm - 80)
                 fx, fz = here[3]
                 hx, hy = fx * co - fz * si, fx * si + fz * co      # look direction on screen
                 n = math.hypot(hx, hy) or 1.0
@@ -2330,9 +2712,10 @@ class FrameSettings(Gtk.Window):
                              f'<polygon points="{tip[0]:.1f},{tip[1]:.1f} {bl[0]:.1f},{bl[1]:.1f} '
                              f'{notch[0]:.1f},{notch[1]:.1f} {br[0]:.1f},{br[1]:.1f}" fill="#fde725" '
                              f'stroke="#0e141b" stroke-width="4" stroke-linejoin="round"/>'
-                             f'<text x="{ux:.1f}" y="{uz + 66:.1f}" fill="#fde725" font-size="24" font-weight="bold" '
+                             f'<text x="{min(max(ux, 110), w - 110):.1f}" y="{uz + 66:.1f}" fill="#fde725" '
+                             f'font-size="24" font-weight="bold" '
                              f'text-anchor="middle" font-family="sans-serif" stroke="#0e141b" stroke-width="6" '
-                             f'paint-order="stroke">You</text>')
+                             f'paint-order="stroke">{"You (off map)" if off else "You"}</text>')
             if inspect:  # Signal tool: a pin and a callout with both links' numbers
                 ix, iy = P(inspect["x"], inspect["z"])
                 order = [inspect["first"]] + [t for t in house_map.TARGETS if t != inspect["first"]]
@@ -2368,9 +2751,8 @@ class FrameSettings(Gtk.Window):
                     parts.append(f'<text x="{bx + 18:.1f}" y="{by + bh - 14:.1f}" fill="#9fb3c8" font-size="16" '
                                  f'font-family="sans-serif">{note}</text>')
             parts.append("</g>")
-            for metres in (0.5, 1, 2, 5, 10, 20):  # scale bar, top left: 60–220 px long
-                if 60 <= metres * s <= 220 or metres == 20:
-                    break
+            fits = [k for k in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100) if k * s <= 220]  # scale bar, top left
+            metres = fits[-1] if fits else 0.05
             bar = metres * s
             unit = f"{metres:g} m"
             parts.append(f'<rect x="12" y="12" width="{bar + 80:.1f}" height="36" rx="8" fill="{bg}" '
@@ -2398,7 +2780,7 @@ class FrameSettings(Gtk.Window):
 
     def show_house_result(self):
         m = self.house_m
-        if not m:
+        if not m or not m.get("samples"):  # nothing walked yet (maybe labels only)
             self.house_result.set_text("")
             return
         sm = house_map.summary(m, self.house_target)
@@ -2419,77 +2801,87 @@ class FrameSettings(Gtk.Window):
         if self.house_rec and self.house_rec.running:
             self.stop_house_walk()
             return
-        if self.wifi_rec and self.wifi_rec.running:
-            set_result(self.house_progress, "Stop the room Wi-Fi map first.", False)
+        if (self.wifi_rec and self.wifi_rec.running) or self._wifi_starting:
+            set_result(self.house_progress, "Stop the play-space map first.", False)
             return
+        if self._house_starting:
+            return
+        self._house_starting = True
+        self.house_btn.set_sensitive(False)
+        self.house_result.set_text("")
+        set_info(self.house_progress, "Starting…")
         self.house_watch_stop()  # the walk follows the headset itself
         rec = house_map.HouseRecorder()
-        segs = [s[5] for s in (self.house_m or {}).get("samples", [])]
-        try:
-            rec.start(segment_offset=max(segs) + 1 if segs else 0)
-        except Exception as e:  # noqa: BLE001
-            set_result(self.house_progress, f"Couldn't start: {e}", False)
-            return
-        self.house_rec = rec
-        self.house_btn.set_label("Stop walking")
-        self.house_result.set_text("")
-        self.set_minimap(self.house_prefs["minimap"])
-        GLib.timeout_add(1000, self.tick_house)
+        segs = [s[house_map.SEG] for s in (self.house_m or {}).get("samples", [])]
+        offset = max(segs) + 1 if segs else 0
 
-    def tick_house(self):
-        rec = self.house_rec
-        if not rec:
-            return False
-        if not rec.running:
+        def started(result):
+            self._house_starting = False
+            self.house_btn.set_sensitive(True)
+            if isinstance(result, Exception):
+                set_result(self.house_progress, f"Couldn't start: {result}", False)
+                return
+            if getattr(self, "_closing", False):
+                rec.stop()
+                return
+            self.house_rec = rec
+            self._you_floor = None
+            self._house_ticks = 0
+            self.house_btn.set_label("Stop walking")
+            set_info(self.house_progress, "Walking: go from room to room at your normal pace.")
+            self.set_minimap(self.house_prefs["minimap"])
+            GLib.timeout_add(1000, safe(self.tick_house), rec)
+        in_background(lambda: rec.start(segment_offset=offset), started)
+
+    def tick_house(self, rec):
+        if rec is not self.house_rec:
+            return False  # that walk is over
+        if not rec.running:  # stopped by itself (an hour)
             self.stop_house_walk()
             return False
         if self.house_prefs["minimap"]:
             self.render_minimap()
         else:
             self.render_house_hud()
-        if self.stack.get_visible_child_name() == "House" and int(rec.elapsed()) % 3 == 0:
-            self.refresh_house()  # redrawing the map every 3 s is plenty
+        self._house_ticks += 1
+        if self._house_ticks % 3 == 0 and self.focused and self.stack.get_visible_child_name() == "House":
+            self.refresh_house()  # redrawing the whole map every 3 s is plenty
         return True
 
     def render_house_hud(self):
-        """Floating readout while walking (when the mini-map is off): the chosen signal big, the other small."""
+        """Floating readout while walking (when the mini-map is off): the chosen link's strength, big."""
         rec = self.house_rec
         el = int(rec.elapsed()) if rec else 0
-        wifi, dongle = (rec.latest, rec.latest_dongle) if rec else (None, None)
-
-        def short(s):
-            return f"{s['dbm']:.0f}" if s and s.get("dbm") is not None else "--"
-        if self.house_target == "wifi":
-            sel, other = wifi, f"Dongle {short(dongle)}"
-        else:
-            sel, other = dongle, f"Wi-Fi {short(wifi)}"
-        title = f"{house_map.TARGETS[self.house_target]} · {other} · {el // 60}:{el % 60:02d}"
+        sel = ((rec.latest_dongle if self.house_target == "dongle" else rec.latest) if rec else None)
+        title = f"{house_map.TARGETS[self.house_target]} · {el // 60}:{el % 60:02d}"
         big = f"{sel['dbm']:.0f} dBm" if sel and sel.get("dbm") is not None else "…"
-        os.makedirs(os.path.dirname(self.WIFI_HUD), exist_ok=True)
         try:
-            with HudRenderer() as r:
-                r.render(title, big, self.WIFI_HUD)
+            self.live_hud().render(title, big, self.WIFI_HUD)
         except Exception:  # noqa: BLE001
-            pass
+            traceback.print_exc()
 
     def stop_house_walk(self):
         rec, self.house_rec = self.house_rec, None
-        subprocess.run(["systemctl", "--user", "stop", self.WIFI_HUD_UNIT, self.MINIMAP_UNIT], capture_output=True)
+        self.set_readout(None)
+        self.close_live_hud()
         self.house_btn.set_label("Start walking")
         if not rec:
             return
         rec.stop()
-        if rec.samples:
-            self.house_m = house_map.add_walk(self.house_m, rec)
-            house_map.save(self.house_m)
+        self.house_m = house_map.finish_walk(self.house_m, rec)
+        n = len(rec.samples)
+        if n:
+            wifi = sum(1 for s in rec.samples if s[house_map.WIFI] is not None)
             dongle = sum(1 for s in rec.samples if s[house_map.DONGLE] is not None)
-            self.house_progress.set_text(
-                f"Added: {rec.distance:.0f} m walked, {len(rec.samples)} readings"
-                + ("" if dongle else ", no dongle readings (PC dongle off?)")
-                + ". Walk more to add rooms, then label the map.")
+            missing = ("no signal readings (Wi-Fi and the PC dongle both off?)" if not (wifi or dongle) else
+                       "no dongle readings (PC dongle off?)" if not dongle else
+                       "no Wi-Fi readings" if not wifi else "")
+            set_result(self.house_progress, f"Added: {rec.distance:.0f} m walked, {n} positions"
+                       + (f", {missing}" if missing else "") + ". Walk more to add rooms, then label the map.", True)
         else:
-            self.house_progress.set_text("No readings: the headset wasn't tracking. Wear it while you walk.")
-        if self.stack.get_visible_child_name() == "House":
+            set_result(self.house_progress, "Nothing added: tracking stopped (is SteamVR running?)." if rec.ended
+                       else "Nothing added: the headset wasn't tracking. Wear it while you walk.", False)
+        if self.focused and self.stack.get_visible_child_name() == "House":
             self.house_watch_start()
         self.draw_house(self.house_m or {})
         self.show_house_result()
@@ -2503,40 +2895,34 @@ class FrameSettings(Gtk.Window):
     def set_minimap(self, on):
         """Shows the mini-map in the middle of your view (it carries the signal readout too), or, with it
         off, the plain floating readout."""
-        subprocess.run(["systemctl", "--user", "stop", self.MINIMAP_UNIT, self.WIFI_HUD_UNIT], capture_output=True)
         if on:
             self.render_minimap()
-            unit, args = self.MINIMAP_UNIT, ["--minimap", self.MINIMAP]
         else:
             self.render_house_hud()
-            unit, args = self.WIFI_HUD_UNIT, ["--live", self.WIFI_HUD]
-        subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}", kitchen_timer.BIN, *args],
-                       capture_output=True)
+        self.set_readout("--minimap" if on else "--live")
 
     def render_minimap(self):
         rec = self.house_rec
         if not rec:
             return
         pose = rec.pose or rec._last or (0.0, house_map.EYE_HEIGHT, 0.0)
-
-        def short(s):
-            return f"{s['dbm']:.0f}" if s and s.get("dbm") is not None else "--"
         dongle = self.house_target == "dongle"
         sel, oth = (rec.latest_dongle, rec.latest) if dongle else (rec.latest, rec.latest_dongle)
         dbm = sel.get("dbm") if sel else None
         word, colour = wifi_map.quality(dbm)
         reading = {"name": house_map.TARGETS[self.house_target], "dbm": dbm, "word": word, "colour": colour,
-                   "other": f"{'Wi-Fi' if dongle else 'Dongle'} {short(oth)}"}
+                   "other": f"{'Wi-Fi' if dongle else 'Dongle'} {dbm_text(oth)}"}
         if not rec.pose:
             reading["note"] = "Not tracking"
-        m = house_map.add_walk(self.copy_house(), rec)
         try:
+            svg = house_map.minimap_svg(house_map.add_walk(self.house_m, rec), pose, rec.heading,
+                                        self.house_target, reading)
             loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
-            loader.write(house_map.minimap_svg(m, pose, rec.heading, self.house_target, reading).encode())
+            loader.write(svg.encode())
             loader.close()
             write_rgba(loader.get_pixbuf(), self.MINIMAP)
         except Exception:  # noqa: BLE001
-            pass
+            traceback.print_exc()
 
     def on_house_clear(self):
         if self.house_rec and self.house_rec.running:
@@ -2544,8 +2930,10 @@ class FrameSettings(Gtk.Window):
         house_map.clear()
         self.house_m = None
         self.house_floor = 0
+        self._label_sel = self._label_undo = self._inspect = None
         self.house_view.update(zoom=1.0, pan=[0.0, 0.0])
-        self.house_progress.set_text("Cleared. Press Start walking to map the house from scratch.")
+        self.house_view.pop("anchor", None)
+        set_info(self.house_progress, "Cleared. Press Start walking to map the house from scratch.")
         self.draw_house({})
         self.show_house_result()
 
@@ -2570,8 +2958,9 @@ class FrameSettings(Gtk.Window):
         """The map as it is now: including the walk in progress."""
         rec = self.house_rec
         if rec and rec.running:
-            self.draw_house(house_map.add_walk(self.copy_house(), rec))
-            self.render_minimap() if self.house_prefs["minimap"] else None
+            self.draw_house(house_map.add_walk(self.house_m, rec))
+            if self.house_prefs["minimap"]:
+                self.render_minimap()
         else:
             self.draw_house(self.house_m or {})
 
@@ -2608,9 +2997,9 @@ class FrameSettings(Gtk.Window):
         if mode == "add":
             labels.append({"name": name, "x": round(x, 2), "z": round(z, 2), "floor": self.house_floor})
             msg = f"Added {name}. Tap again to add another, or pick another name."
-        elif mode == "move" and self._label_sel is not None:
+        elif mode == "move" and self._label_sel is not None and self._label_sel < len(labels):
             lab = labels[self._label_sel]
-            lab["x"], lab["z"] = round(x, 2), round(z, 2)
+            lab["x"], lab["z"], lab["floor"] = round(x, 2), round(z, 2), self.house_floor
             self._label_sel = None
             msg = f"Moved {lab['name']}. Tap another label to move it."
         elif near is None:
@@ -2696,6 +3085,7 @@ class FrameSettings(Gtk.Window):
 
         hgt = card("Ceiling height", "Measure it once: hold a controller flat against the ceiling over your "
                                      "play area while the countdown runs (sitting or standing, not reclined).")
+        self._ceil_height_timer = None
         self.ceil_height = Spin(150, 400, 1, int(round(c["height"] * 100)), width_chars=6,
                                 fmt=lambda v: f"{v / 100:.2f} m", wrap=False,
                                 on_change=lambda v: self.on_ceiling_height(v))
@@ -2712,27 +3102,44 @@ class FrameSettings(Gtk.Window):
         return box
 
     def show_ceiling_page(self):
-        self.stack.set_visible_child_name("Ceiling")
-        self.refresh_ceiling_status()
+        self.show_page("Ceiling")
 
     def refresh_ceiling_status(self):
         c = ceiling.load()
         on = bool(c["enabled"]) and ceiling.any_mode(c)
-        running = ceiling.service_active()
-        self.ceil_status.set_text(
-            ("Indicator running. " if running else "Indicator off. " if not on else "Indicator should be on but "
-             "isn't running yet. ") +
-            ("Height not measured yet: using the value above." if not c.get("measured") else
-             f"Ceiling {c['height']:.2f} m above the floor."))
+        height = ("Height not measured yet: using the value above." if not c.get("measured") else
+                  f"Ceiling {c['height']:.2f} m above the floor.")
 
-    def ceiling_save(self, c, message=None):
+        def done(running):
+            self.ceil_status.set_text(
+                ("Indicator running. " if running is True else "Indicator off. " if not on else
+                 "Indicator on, but not running right now (it runs while SteamVR does). ") + height)
+        in_background(ceiling.service_active, done)
+
+    def ceiling_save(self, c, message=None, centre=False):
+        """Saves the settings (the overlay re-reads them by itself), then starts or stops the overlay to
+        match, in order, in the background (systemd and SteamVR can take a moment).
+        centre=True: also find the play area's middle first (where the grid goes)."""
         ceiling.save(c)
-        if c.get("upmarker") and c.get("enabled"):
-            self.render_ceiling_markers()
-        ok, msg = ceiling.apply_service(c)
-        if message:
-            set_result(self.ceil_result, message if ok else f"{message} (but: {msg})", ok)
-        self.refresh_ceiling_status()
+        restart = bool(c.get("upmarker") and c.get("enabled")) and self.render_ceiling_markers()
+
+        def job():
+            if centre:
+                cx, cz = ceiling.play_area_centre()
+                cur = ceiling.load()
+                if (cur["cx"], cur["cz"]) == (0.0, 0.0):
+                    cur["cx"], cur["cz"] = cx, cz
+                    ceiling.save(cur)
+            return ceiling.apply_service(ceiling.load(), restart=restart)
+
+        def done(result):
+            ok, msg = result if isinstance(result, tuple) else (False, str(result))
+            if message:
+                set_result(self.ceil_result, message if ok else f"{message} (but: {msg})", ok)
+            elif not ok:
+                set_result(self.ceil_result, f"Ceiling indicator: {msg}", False)
+            self.refresh_ceiling_status()
+        self.jobs.put(job, done)
 
     def on_ceiling_switch(self, sw, _pspec, key):
         if getattr(self, "_ceil_loading", False):
@@ -2744,14 +3151,22 @@ class FrameSettings(Gtk.Window):
             self._ceil_loading = True
             self.ceil_switches["enabled"].set_active(True)
             self._ceil_loading = False
-        if c["enabled"] and (c["cx"], c["cz"]) == (0.0, 0.0):
-            c["cx"], c["cz"] = ceiling.play_area_centre()
-        self.ceiling_save(c)
+        self.ceiling_save(c, centre=bool(c["enabled"]) and (c["cx"], c["cz"]) == (0.0, 0.0))
 
     def on_ceiling_height(self, cm):
+        """Saved after a short pause, so stepping through values isn't a save per tap (the overlay
+        re-reads the file by itself)."""
+        if self._ceil_height_timer:
+            GLib.source_remove(self._ceil_height_timer)
+        self._ceil_height_timer = GLib.timeout_add(700, self._save_ceiling_height, cm)
+
+    def _save_ceiling_height(self, cm):
+        self._ceil_height_timer = None
         c = ceiling.load()
         c["height"] = round(cm / 100, 2)
-        self.ceiling_save(c)
+        ceiling.save(c)
+        self.refresh_ceiling_status()
+        return False
 
     def on_ceiling_measure(self, *_):
         self.ceil_measure_btn.set_sensitive(False)
@@ -2763,6 +3178,9 @@ class FrameSettings(Gtk.Window):
                 set_result(self.ceil_result, f"Couldn't measure: {result}", False)
                 return
             (height, n), (cx, cz) = result
+            if self._ceil_height_timer:  # a height typed meanwhile is replaced by the measured one
+                GLib.source_remove(self._ceil_height_timer)
+                self._ceil_height_timer = None
             c = ceiling.load()
             c.update(height=height, cx=cx, cz=cz, measured=1)
             self.ceil_height.set(int(round(height * 100)))
@@ -2770,13 +3188,24 @@ class FrameSettings(Gtk.Window):
         in_background(lambda: (ceiling.measure(), ceiling.play_area_centre()), done)
 
     def render_ceiling_markers(self):
+        """Draws the overlay's UP / DOWN pictures when missing or out of date. Returns True when it drew
+        new ones (a running overlay only loads them when it starts)."""
+        stamp = hashlib.sha1((CSS.decode() + "\0" + updater.local_version()).encode()).hexdigest()
+        stamp_file = os.path.join(ceiling.DATA, "stamp.txt")
+        files = [os.path.join(ceiling.DATA, "up.rgba"), os.path.join(ceiling.DATA, "down.rgba")]
+        if read(stamp_file) == stamp and all(os.path.exists(f) for f in files):
+            return False
         os.makedirs(ceiling.DATA, exist_ok=True)
         try:
             with HudRenderer() as r:
-                r.render("Real ceiling", "UP", os.path.join(ceiling.DATA, "up.rgba"))
-                r.render("Real floor", "DOWN", os.path.join(ceiling.DATA, "down.rgba"))
+                r.render("Real ceiling", "UP", files[0])
+                r.render("Real floor", "DOWN", files[1])
+            with open(stamp_file, "w", encoding="utf-8") as f:
+                f.write(stamp)
         except Exception:  # noqa: BLE001
-            pass
+            traceback.print_exc()
+            return False
+        return True
 
     def build_room_preview_page(self):
         """The big preview (no menu entry: opened from a room's Preview button)."""
@@ -2790,8 +3219,9 @@ class FrameSettings(Gtk.Window):
         back = Gtk.Button(label="‹ Back to rooms")
         back.connect("clicked", lambda *_: self.show_page("Rooms"))
         head.pack_start(back, False, False, 0)
-        head.pack_start(label(("Room in use now" if current else m.get("name", "Room")), "page-title"),
-                        False, False, 0)
+        title = label(("Room in use now" if current else m.get("name", "Room")), "page-title")
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        head.pack_start(title, True, True, 0)
         self.preview_box.pack_start(head, False, False, 0)
 
         row = Gtk.Box(spacing=26)
@@ -2824,21 +3254,37 @@ class FrameSettings(Gtk.Window):
         self.stack.set_visible_child_name("RoomPreview")
 
     def refresh_rooms(self):
+        """Reading the room in use needs the system journal (slow after a long uptime): gather
+        everything in the background, then build the page."""
+        self._rooms_seq += 1
+        seq = self._rooms_seq
+
+        def gather():
+            return rooms.current(), rooms.list_rooms(), rooms.backup_exists()
+
+        def done(result):
+            if seq != self._rooms_seq:
+                return  # a newer refresh is on its way
+            if isinstance(result, Exception):
+                set_result(self.rooms_result, f"Couldn't read the rooms: {result}", False)
+                return
+            self.fill_rooms(*result)
+        in_background(gather, done)
+
+    def fill_rooms(self, now, saved, backup):
         def facts(m):
             if not m.get("maps"):
                 return "No room map yet."
-            return f"{m['area']} m² boundary · map {m['map_mb']} MB"
-        now = rooms.current()
+            return f"{m.get('area', 0)} m² boundary · map {m.get('map_mb', 0)} MB"
         try:
             self.room_now_img.set_from_pixbuf(self.room_preview(now))
         except GLib.Error:
             pass
         self.room_now_lbl.set_text(facts(now))
-        self.undo_btn.set_sensitive(rooms.backup_exists())
+        self.undo_btn.set_sensitive(backup)
 
         for child in self.rooms_grid_holder.get_children():
             self.rooms_grid_holder.remove(child)
-        saved = rooms.list_rooms()
         cards_ = []
         for m in saved:
             c = card()
@@ -2866,7 +3312,7 @@ class FrameSettings(Gtk.Window):
 
             # rename + delete
             edit = Gtk.Box(spacing=10)
-            entry = Gtk.Entry(text=m.get("name", ""))
+            entry = Gtk.Entry(text=m.get("name", ""), max_length=40)
             edit.pack_start(entry, True, True, 0)
             ren = Gtk.Button(label="Rename")
             ren.connect("clicked", lambda _b, rid=m["id"], e=entry: self.rename_room(rid, e.get_text()))
@@ -2885,24 +3331,35 @@ class FrameSettings(Gtk.Window):
         self.rooms_grid_holder.show_all()
 
     def reset_save_button(self):
+        if self._replace_timer:
+            GLib.source_remove(self._replace_timer)
+            self._replace_timer = None
         self._replace_armed = (None, 0)
-        self.room_save_btn.set_label("Save")
+        self.room_save_lbl.set_text("Save")
         self.room_save_btn.get_style_context().remove_class("armed")
 
+    def _replace_expired(self):
+        self._replace_timer = None  # ends by returning False
+        self.reset_save_button()
+        return False
+
     def on_save_room(self, *_):
-        name = self.room_name.get_text().strip() or "Room"
+        name = " ".join(self.room_name.get_text().split())[:40] or "Room"
         existing = rooms.find_by_name(name)
         armed_name, until = self._replace_armed
-        if existing and not (armed_name == name and time.time() < until):
-            self._replace_armed = (name, time.time() + 5)
-            self.room_save_btn.set_label(f"Tap again to replace '{name}'")
+        if existing and not (armed_name == name and time.monotonic() < until):
+            self.reset_save_button()
+            self._replace_armed = (name, time.monotonic() + 5)
+            self.room_save_lbl.set_text(f"Tap again to replace '{name}'")
             self.room_save_btn.get_style_context().add_class("armed")
-            GLib.timeout_add(5000, lambda: (self.reset_save_button(), False)[1])
+            self._replace_timer = GLib.timeout_add(5000, self._replace_expired)
             return
         self.reset_save_button()
-        set_result(self.rooms_result, f"Saving '{name}'…", True)
+        self.room_save_btn.set_sensitive(False)  # one save at a time (copying the room map takes a moment)
+        set_info(self.rooms_result, f"Saving '{name}'…")
 
         def done(result):
+            self.room_save_btn.set_sensitive(True)
             if isinstance(result, Exception):
                 set_result(self.rooms_result, f"Couldn't save: {result}", False)
             else:
@@ -2911,22 +3368,34 @@ class FrameSettings(Gtk.Window):
         in_background(lambda: rooms.save(name, existing), done)
 
     def rename_room(self, rid, name):
-        if not name.strip():
+        name = " ".join(name.split())[:40]
+        if not name:
             set_result(self.rooms_result, "Type a name first.", False)
             return
-        rooms.rename(rid, name)
-        set_result(self.rooms_result, f"Renamed to '{name.strip()}'.", True)
-        self.refresh_rooms()
+
+        def done(result):
+            if isinstance(result, Exception):
+                set_result(self.rooms_result, f"Couldn't rename: {result}", False)
+            else:
+                set_result(self.rooms_result, f"Renamed to '{name}'.", True)
+            self.refresh_rooms()
+        in_background(lambda: rooms.rename(rid, name), done)
 
     def delete_room(self, rid, name):
-        rooms.delete(rid)
-        set_result(self.rooms_result, f"Deleted '{name}'.", True)
-        self.refresh_rooms()
+        def done(result):
+            if isinstance(result, Exception):
+                set_result(self.rooms_result, f"Couldn't delete: {result}", False)
+            else:
+                set_result(self.rooms_result, f"Deleted '{name}'.", True)
+            self.refresh_rooms()
+        in_background(lambda: rooms.delete(rid), done)
 
     def load_room(self, rid, name):
-        ok, msg = rooms.start_load(rid)
-        set_result(self.rooms_result, f"Loading '{name}': SteamVR restarts now. Reopen Deckhand in a moment."
-                   if ok else f"Couldn't load: {msg}", ok)
+        def done(result):
+            ok, msg = result if isinstance(result, tuple) else (False, str(result))
+            set_result(self.rooms_result, f"Loading '{name}': SteamVR restarts now. Reopen Deckhand in a moment."
+                       if ok else f"Couldn't load: {msg}", ok)
+        in_background(lambda: rooms.start_load(rid), done)
 
     # ============================================================ recline
     def build_recline(self):
@@ -3005,7 +3474,6 @@ class FrameSettings(Gtk.Window):
         share.pack_start(self.share_copy, False, False, 0)
         share.pack_start(label(f"Same as the full command on github.com/{updater.REPO}", "desc", wrap=True,
                                selectable=True), False, False, 0)
-        box.pack_start(self.two_columns(upd, share), False, False, 0)
 
         rm = card("Remove Deckhand", "Uninstalls the app and everything it installed on this Frame.")
         self.rm_open = Gtk.Button(label="Remove Deckhand…")
@@ -3020,16 +3488,18 @@ class FrameSettings(Gtk.Window):
         self.rm_keep.connect("notify::active", lambda *_: self.refresh_remove_warning())
         self.rm_box.pack_start(switch_row("Keep my data", label("Keep my saved rooms, maps and reminders",
                                                                 "desc", wrap=True), self.rm_keep), False, False, 0)
-        rrow = Gtk.Box(spacing=10, homogeneous=True)
+        rrow = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)  # stacked: fits in half a row
+        rrow.pack_start(HoldButton("Hold 5 s to remove everything", self.do_remove_all, seconds=5.0),
+                        False, False, 0)
         cancel = Gtk.Button(label="Cancel")
         cancel.connect("clicked", lambda *_: (self.rm_box.hide(), self.rm_open.show()))
-        cancel.set_valign(Gtk.Align.START)
-        rrow.pack_start(cancel, True, True, 0)
-        rrow.pack_start(HoldButton("Hold 5 s to remove everything", self.do_remove_all, seconds=5.0),
-                        True, True, 0)
+        rrow.pack_start(cancel, False, False, 0)
         self.rm_box.pack_start(rrow, False, False, 0)
         rm.pack_start(self.rm_box, False, False, 0)
-        box.pack_start(rm, False, False, 0)
+        box.pack_start(self.two_columns(upd, rm), False, False, 0)
+        # The install command gets a whole row: it's big and must stay on one line (half a row made
+        # the window wider than the screen).
+        box.pack_start(share, False, False, 0)
         box.pack_start(label(f"Deckhand lives in {ROOT}", "desc", wrap=True), False, False, 0)
         return box
 
@@ -3086,7 +3556,9 @@ class FrameSettings(Gtk.Window):
             self.upd_btn.set_sensitive(True)
             if isinstance(res, Exception):
                 self.upd_go.set_sensitive(True)
-                set_result(self.upd_lbl, f"Update failed: {res}", False)
+                msg = str(res).strip()
+                set_result(self.upd_lbl, (msg if msg.startswith("Updated files") else f"Update failed: {msg}")
+                           + " Tap Update to try again.", False)
                 return
             self.upd_new = None
             self.upd_go.set_label("Update")
@@ -3171,8 +3643,9 @@ class FrameSettings(Gtk.Window):
         self.sys_lbl.set_text("\n".join(lines))
 
     def do_restart_steamvr(self):
-        subprocess.Popen(["systemctl", "--user", "restart", "--no-block", "steamvr.service"],
-                         start_new_session=True)
+        # --no-block: systemd does the restart by itself; this returns at once (this window closes too)
+        subprocess.run(["systemctl", "--user", "restart", "--no-block", "steamvr.service"], capture_output=True,
+                       timeout=15)
 
 
 def snapshot(prefix):
@@ -3195,7 +3668,7 @@ def snapshot(prefix):
         ("House", win.show_house_page),
         ("House-dongle", lambda: (win.house_target_seg.set_value("dongle"), win.on_house_target("dongle"))),
         ("Ceiling", win.show_ceiling_page)]
-    if win.house_m:  # the mini-map, as it would look in the middle of the house walk
+    if win.house_m and win.house_m.get("samples"):  # the mini-map, as it would look in the middle of a walk
         smp = win.house_m["samples"][len(win.house_m["samples"]) // 2]
         loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
         word, colour = wifi_map.quality(-61)
