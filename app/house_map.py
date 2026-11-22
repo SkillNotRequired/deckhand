@@ -8,7 +8,7 @@ strength of BOTH links:
                 (iw <ap iface> station dump: how loudly the Frame hears the dongle)
 
 Heights split floors. Results: a top-down map per floor (0.5 m squares coloured by the
-chosen signal, the edge of where you walked, your path, labels) and a simple 3D model (.glb).
+chosen signal, the edge of where you walked, your path, labels).
 Tracking can jump if the Frame re-recognises a room; a jump over 2 m starts a new
 path segment instead of drawing a line across the house.
 """
@@ -16,7 +16,6 @@ import html
 import json
 import math
 import os
-import struct
 import subprocess
 import threading
 import time
@@ -25,12 +24,10 @@ import wifi_map
 
 HOUSE = os.path.expanduser("~/.local/share/frame-settings/wifi-house")
 CURRENT = os.path.join(HOUSE, "current.json")
-EXPORTS = os.path.expanduser("~/Documents/Deckhand")
 CELL = 0.5
 MAX_SECONDS = 3600
 FLOOR_HEIGHT = 2.7   # metres between storeys (for splitting floors)
 EYE_HEIGHT = 1.6     # head above its floor, roughly
-WALL_HEIGHT = 2.4
 LABELS = ["Router", "PC", "Bedroom", "Kitchen", "Living room", "Office", "Bathroom", "Garage", "Hall"]
 TARGETS = wifi_map.TARGETS
 
@@ -306,128 +303,6 @@ def clear():
     for f in os.listdir(HOUSE):
         if f == "current.json" or (f.startswith("house-") and f.endswith(".json")):
             os.replace(os.path.join(HOUSE, f), os.path.join(HOUSE, f"cleared-{stamp}-{f}"))
-
-
-# ------------------------------------------------------------ 3D model ---
-def _srgb_to_linear(hex_colour):
-    c = [int(hex_colour[i:i + 2], 16) / 255 for i in (1, 3, 5)]
-    return [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
-
-
-def export_glb(m, target="wifi", path=None):
-    """Simple 3D model: dark floor tiles where you walked, see-through panels along the edge of the
-    walked area, a column per 0.5 m square (taller and greener = stronger
-    signal for `target`), a light trail at head height, labels as tall poles. Y up, metres.
-    One material per colour, so any viewer shows the colours (Windows 3D Viewer, Blender…)."""
-    samples = m.get("samples", [])
-    if not samples:
-        raise RuntimeError("nothing to export: walk the house first")
-    base = floor_base(samples)
-    groups = {}  # material name -> (colour hex, alpha, [positions], [indices])
-
-    def box(x0, y0, z0, x1, y1, z1, name, colour, alpha=1.0):
-        _c, _a, pos, idx = groups.setdefault(name, (colour, alpha, [], []))
-        start = len(pos)
-        for x in (x0, x1):
-            for y in (y0, y1):
-                for z in (z0, z1):
-                    pos.append((x, y, z))
-        # corners: index = xi*4 + yi*2 + zi; faces wound outwards
-        for a, b, c, d in ((0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)):
-            idx.extend((start + a, start + b, start + c, start + a, start + c, start + d))
-
-    def wall(xa, za, xb, zb, y0, name, colour, alpha, thick=0.04):
-        """A vertical panel from (xa, za) to (xb, zb): a thin box turned along the segment."""
-        _c, _a, pos, idx = groups.setdefault(name, (colour, alpha, [], []))
-        dx, dz = xb - xa, zb - za
-        ln = math.hypot(dx, dz)
-        if ln < 1e-3:
-            return
-        nx, nz = -dz / ln * thick / 2, dx / ln * thick / 2
-        start = len(pos)
-        for (px, pz) in ((xa - nx, za - nz), (xa + nx, za + nz), (xb - nx, zb - nz), (xb + nx, zb + nz)):
-            pos.append((px, y0, pz))
-            pos.append((px, y0 + WALL_HEIGHT, pz))
-        # quads: sides + ends + top (bottom never seen)
-        for a, b, c, d in ((0, 4, 5, 1), (2, 3, 7, 6), (0, 1, 3, 2), (4, 6, 7, 5), (1, 5, 7, 3)):
-            idx.extend((start + a, start + b, start + c, start + a, start + c, start + d))
-
-    for f, i, j in footprint(samples):
-        y0 = f * FLOOR_HEIGHT
-        box(i * CELL, y0 - 0.03, j * CELL, (i + 1) * CELL, y0, (j + 1) * CELL, "floor (where you walked)", "#2a3340")
-    for (f, i, j), (dbm, _tx, _n) in cells(samples, target).items():
-        y0 = f * FLOOR_HEIGHT
-        x0, z0 = i * CELL, j * CELL
-        h = 0.1 + 1.2 * max(0.0, min(1.0, (dbm + 90) / 50))                      # -90 → 0.1 m, -40 → 1.3 m
-        band = min(9, int(wifi_map.strength(dbm) * 10))         # 10 colour steps: one material each
-        lo = wifi_map.DBM_LOW + band * (wifi_map.DBM_HIGH - wifi_map.DBM_LOW) / 10
-        g = 0.07
-        box(x0 + g, y0, z0 + g, x0 + CELL - g, y0 + h, z0 + CELL - g, f"{TARGETS[target]} {lo:.0f} dBm",
-            wifi_map.fill(lo + 3))
-    for f in floors(samples):
-        y0 = f * FLOOR_HEIGHT
-        for xa, za, xb, zb in outline_edges(samples, f):
-            wall(xa, za, xb, zb, y0, "outline (edge of where you walked)", "#66ccff", 0.25, thick=0.02)
-    last = None
-    for s in samples:                                                            # trail every ~0.4 m
-        x, y, z = s[0], s[1], s[2]
-        if last is None or math.dist((x, y, z), last) > 0.4:
-            fy = floor_of(y, base) * FLOOR_HEIGHT + EYE_HEIGHT
-            box(x - 0.03, fy - 0.03, z - 0.03, x + 0.03, fy + 0.03, z + 0.03, "path", "#eef4fa")
-            last = (x, y, z)
-    for lab in m.get("labels", []):
-        fy = lab.get("floor", 0) * FLOOR_HEIGHT
-        box(lab["x"] - 0.04, fy, lab["z"] - 0.04, lab["x"] + 0.04, fy + 2.2, lab["z"] + 0.04,
-            f"label {lab['name']}", "#66ccff")
-
-    binary = b""
-    views, accessors, materials, prims = [], [], [], []
-    total_v = total_t = 0
-    for name, (colour, alpha, pos, idx) in groups.items():
-        if not pos:
-            continue
-        pos_b = b"".join(struct.pack("<3f", *p) for p in pos)
-        idx_b = struct.pack(f"<{len(idx)}I", *idx)
-        views.append({"buffer": 0, "byteOffset": len(binary), "byteLength": len(pos_b), "target": 34962})
-        binary += pos_b
-        views.append({"buffer": 0, "byteOffset": len(binary), "byteLength": len(idx_b), "target": 34963})
-        binary += idx_b
-        accessors.append({"bufferView": len(views) - 2, "componentType": 5126, "count": len(pos), "type": "VEC3",
-                          "min": [min(p[k] for p in pos) for k in range(3)],
-                          "max": [max(p[k] for p in pos) for k in range(3)]})
-        accessors.append({"bufferView": len(views) - 1, "componentType": 5125, "count": len(idx), "type": "SCALAR"})
-        mat = {"name": name, "doubleSided": True,
-               "pbrMetallicRoughness": {"baseColorFactor": _srgb_to_linear(colour) + [alpha],
-                                        "metallicFactor": 0, "roughnessFactor": 1}}
-        if alpha < 1:
-            mat["alphaMode"] = "BLEND"
-        materials.append(mat)
-        prims.append({"attributes": {"POSITION": len(accessors) - 2}, "indices": len(accessors) - 1,
-                      "material": len(materials) - 1})
-        total_v += len(pos)
-        total_t += len(idx) // 3
-    binary += b"\0" * (-len(binary) % 4)
-    gltf = {
-        "asset": {"version": "2.0", "generator": "Deckhand house map"},
-        "scene": 0, "scenes": [{"nodes": [0]}],
-        "nodes": [{"mesh": 0, "name": f"House map ({TARGETS[target]})"}],
-        "meshes": [{"name": "house", "primitives": prims}],
-        "materials": materials,
-        "buffers": [{"byteLength": len(binary)}],
-        "bufferViews": views,
-        "accessors": accessors,
-    }
-    js = json.dumps(gltf, separators=(",", ":")).encode()
-    js += b" " * (-len(js) % 4)
-    total = 12 + 8 + len(js) + 8 + len(binary)
-    data = (struct.pack("<III", 0x46546C67, 2, total) + struct.pack("<II", len(js), 0x4E4F534A) + js
-            + struct.pack("<II", len(binary), 0x004E4942) + binary)
-    if not path:
-        os.makedirs(EXPORTS, exist_ok=True)
-        path = os.path.join(EXPORTS, time.strftime(f"house-{target}-%Y%m%d-%H%M.glb"))
-    with open(path, "wb") as f:
-        f.write(data)
-    return path, total_v, total_t
 
 
 # ------------------------------------------------------------- mini-map ---

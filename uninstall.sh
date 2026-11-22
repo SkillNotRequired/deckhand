@@ -3,7 +3,7 @@
 # this; you can also run it from Konsole):
 #
 #   ~/Deckhand/uninstall.sh              remove everything, including your saved rooms, maps,
-#                                        reminders and exported 3D models
+#                                        reminders and old exports (~/Documents/Deckhand)
 #   ~/Deckhand/uninstall.sh --keep-data  keep those (settings and data folders, ~/Documents/Deckhand)
 #   DECKHAND_DRY_RUN=1 ~/Deckhand/uninstall.sh   only print what it would do
 #

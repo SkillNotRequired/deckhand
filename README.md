@@ -15,7 +15,7 @@ doesn't have (yet). Runs from your Steam library, in VR, no desktop mode needed.
 | **Reminders** | A popup in the headset at a set time and date. |
 | **Comfort** | Screenshot blocker (no accidental screenshots), other comfort toggles. |
 | **Rooms** | Save and name play areas, preview them, load one instead of redrawing the boundary. Ceiling indicator for lying down. |
-| **Signal** | Home Wi-Fi *and* Steam dongle signal, live. Play-space map shows the best spot to stand; whole-house map walks your home into a floor plan coloured by signal that you can drag, rotate and zoom, with a "You" marker, a game-style mini-map in the middle of your view, and a 3D model export (.glb). |
+| **Signal** | Home Wi-Fi *and* Steam dongle signal, live. Play-space map shows the best spot to stand; whole-house map walks your home into a floor plan coloured by signal that you can drag, rotate and zoom, with a "You" marker and a game-style mini-map in the middle of your view. |
 | **Recline** | Controls for Recline VR (play lying down). |
 | **System** | Headset info, restart SteamVR, **Update app**. |
 

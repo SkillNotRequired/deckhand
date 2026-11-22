@@ -49,7 +49,7 @@ import rooms  # noqa: E402  (saved play areas, experimental)
 import reminders  # noqa: E402  (reminders at a time and date)
 import wifi_map  # noqa: E402  (Wi-Fi signal map of the play space)
 import ceiling  # noqa: E402  (ceiling indicator)
-import house_map  # noqa: E402  (whole-house Wi-Fi walk + 3D model)
+import house_map  # noqa: E402  (whole-house Wi-Fi walk)
 import updater  # noqa: E402  (Update app: newest version from GitHub)
 import datetime  # noqa: E402
 import struct  # noqa: E402
@@ -1585,7 +1585,7 @@ class FrameSettings(Gtk.Window):
         b.connect("clicked", lambda *_: self.show_wifi_page())
         room.pack_start(b, False, False, 0)
         house = card("Whole-house map", "Walk every room (several walks add up): a floor plan coloured by "
-                                        "signal, with walls you trace, and a 3D model to export.")
+                                        "signal, with labels and a mini-map in view.")
         b = add_class(Gtk.Button(label="Open whole-house map ›"), "primary")
         b.connect("clicked", lambda *_: self.show_house_page())
         house.pack_start(b, False, False, 0)
@@ -1958,12 +1958,7 @@ class FrameSettings(Gtk.Window):
         undo = Gtk.Button(label="Undo")
         undo.connect("clicked", self.on_house_undo_label)
         acts2.pack_start(undo, True, True, 0)
-        export = add_class(Gtk.Button(label="Export 3D model"), "primary")
-        export.connect("clicked", self.on_house_export)
-        acts2.pack_start(export, True, True, 0)
         side.pack_start(acts2, False, False, 0)
-        self.house_export_lbl = label("", "desc", wrap=True, selectable=True)
-        side.pack_start(self.house_export_lbl, False, False, 0)
         # The controls scroll on their own, so the map stays in view while you label it.
         side_sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
         side_sw.set_size_request(-1, 860)
@@ -2491,7 +2486,7 @@ class FrameSettings(Gtk.Window):
             self.house_progress.set_text(
                 f"Added: {rec.distance:.0f} m walked, {len(rec.samples)} readings"
                 + ("" if dongle else ", no dongle readings (PC dongle off?)")
-                + ". Walk more to add rooms, then label the map and export the 3D model.")
+                + ". Walk more to add rooms, then label the map.")
         else:
             self.house_progress.set_text("No readings: the headset wasn't tracking. Wear it while you walk.")
         if self.stack.get_visible_child_name() == "House":
@@ -2551,7 +2546,6 @@ class FrameSettings(Gtk.Window):
         self.house_floor = 0
         self.house_view.update(zoom=1.0, pan=[0.0, 0.0])
         self.house_progress.set_text("Cleared. Press Start walking to map the house from scratch.")
-        self.house_export_lbl.set_text("")
         self.draw_house({})
         self.show_house_result()
 
@@ -2673,18 +2667,6 @@ class FrameSettings(Gtk.Window):
             self.show_house_result()
         else:
             self.label_status.set_text("Nothing to undo.")
-
-    def on_house_export(self, *_):
-        if not self.house_m:
-            self.house_export_lbl.set_text("Walk the house first.")
-            return
-        try:
-            path, verts, tris = house_map.export_glb(self.house_m, self.house_target)
-        except Exception as e:  # noqa: BLE001
-            self.house_export_lbl.set_text(f"Couldn't export: {e}")
-            return
-        self.house_export_lbl.set_text(f"Saved {path}\n({tris:,} triangles, {house_map.TARGETS[self.house_target]}"
-                                       "). Open it in Blender or Windows 3D Viewer.")
 
     # =========================================================== ceiling
     def build_ceiling_page(self):
@@ -3036,7 +3018,7 @@ class FrameSettings(Gtk.Window):
         self.rm_box.pack_start(self.rm_warn, False, False, 0)
         self.rm_keep = Gtk.Switch(active=False)
         self.rm_keep.connect("notify::active", lambda *_: self.refresh_remove_warning())
-        self.rm_box.pack_start(switch_row("Keep my data", label("Keep my saved rooms, maps, reminders and 3D models",
+        self.rm_box.pack_start(switch_row("Keep my data", label("Keep my saved rooms, maps and reminders",
                                                                 "desc", wrap=True), self.rm_keep), False, False, 0)
         rrow = Gtk.Box(spacing=10, homogeneous=True)
         cancel = Gtk.Button(label="Cancel")
@@ -3121,8 +3103,8 @@ class FrameSettings(Gtk.Window):
             "• Its background jobs: auto shut-off, sleep timer, ceiling indicator, reminders, kitchen timer",
             "• The fan helper and its password-free rule, if you ran setup: the fan goes back to stock",
             "• Screenshots are turned back on (if you blocked them here)",
-            ("• <b>Kept:</b> your saved rooms, Wi-Fi and house maps, reminders and exported 3D models" if keep else
-             "• <b>Also deleted:</b> your saved rooms, Wi-Fi and house maps, reminders and exported 3D models "
+            ("• <b>Kept:</b> your saved rooms, Wi-Fi and house maps and reminders" if keep else
+             "• <b>Also deleted:</b> your saved rooms, Wi-Fi and house maps, reminders and old exports "
              "(~/Documents/Deckhand). This can't be undone."),
             "Not touched: SteamVR, its other settings, and the room/boundary SteamVR is using now.",
         ]
