@@ -2629,9 +2629,11 @@ class FrameSettings(Gtk.Window):
         self.upd_new = None
         self.upd_checked = False
         share = card("Share with a friend", "On their Steam Frame, in Desktop mode, open Konsole and paste:")
-        cmd = label(f"curl -fsSL https://raw.githubusercontent.com/{updater.REPO}/main/install.sh | bash",
-                    "status", wrap=True, selectable=True)
-        share.pack_start(cmd, False, False, 0)
+        self.share_cmd = f"curl -fsSL https://raw.githubusercontent.com/{updater.REPO}/main/install.sh | bash"
+        share.pack_start(label(self.share_cmd, "status", wrap=True, selectable=True), False, False, 0)
+        self.share_copy = add_class(Gtk.Button(label="Copy to clipboard"), "primary")
+        self.share_copy.connect("clicked", self.on_share_copy)
+        share.pack_start(self.share_copy, False, False, 0)
         share.pack_start(label(f"github.com/{updater.REPO}", "desc", selectable=True), False, False, 0)
         box.pack_start(self.two_columns(upd, share), False, False, 0)
 
@@ -2660,6 +2662,15 @@ class FrameSettings(Gtk.Window):
         box.pack_start(rm, False, False, 0)
         box.pack_start(label(f"Deckhand lives in {ROOT}", "desc", wrap=True), False, False, 0)
         return box
+
+    def on_share_copy(self, *_):
+        """Puts the install command on the clipboard (kept after Deckhand closes where a clipboard
+        manager runs, e.g. Desktop mode)."""
+        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clip.set_text(self.share_cmd, -1)
+        clip.store()
+        self.share_copy.set_label("Copied ✓")
+        GLib.timeout_add(3000, lambda: (self.share_copy.set_label("Copy to clipboard"), False)[1])
 
     def on_update_check(self, *_):
         self.upd_checked = True
