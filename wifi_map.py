@@ -95,15 +95,57 @@ def dongle_signal(iface=None):
 TARGETS = {"wifi": "Home Wi-Fi", "dongle": "Steam dongle"}
 
 
+# Signal colours: the "viridis" scale (dark purple = weak → blue → teal → green → bright yellow =
+# strong). It changes steadily in brightness, so it reads the same with red-green colour blindness.
+DBM_LOW, DBM_HIGH = -90.0, -30.0
+VIRIDIS = ["#440154", "#482475", "#414487", "#355f8d", "#2a788e", "#21918c",
+           "#22a884", "#44bf70", "#7ad151", "#bddf26", "#fde725"]
+WORDS = ((-50, "excellent"), (-60, "good"), (-67, "fair"), (-75, "weak"))
+
+
+def _rgb(h):
+    return [int(h[i:i + 2], 16) for i in (1, 3, 5)]
+
+
+def strength(dbm):
+    """0 (-90 dBm or worse) … 1 (-30 dBm or better)."""
+    return max(0.0, min(1.0, (dbm - DBM_LOW) / (DBM_HIGH - DBM_LOW)))
+
+
+def fill(dbm):
+    """Map colour for a signal strength (colour-blind safe gradient)."""
+    t = strength(dbm) * (len(VIRIDIS) - 1)
+    i = min(int(t), len(VIRIDIS) - 2)
+    a, b, f = _rgb(VIRIDIS[i]), _rgb(VIRIDIS[i + 1]), t - i
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * f) for x, y in zip(a, b))
+
+
 def quality(dbm):
-    """(word, colour) for a signal strength. For streaming VR, -60 dBm or better is what you want."""
+    """(word, text colour) for a signal strength. The colour is the map gradient, lightened at the
+    weak end so it stays readable on the dark background. For streaming VR, aim for -60 dBm or better."""
     if dbm is None:
         return "no signal", "#8a96a3"
-    for limit, word, colour in ((-50, "excellent", "#3ccf6e"), (-60, "good", "#9bd93c"),
-                                (-67, "fair", "#f2d13c"), (-75, "weak", "#f28c3c")):
-        if dbm >= limit:
-            return word, colour
-    return "poor", "#e5484d"
+    word = next((w for limit, w in WORDS if dbm >= limit), "poor")
+    t = strength(dbm)
+    mix = 0.45 * (1 - t)  # blend toward white at the dark end
+    return word, "#%02x%02x%02x" % tuple(round(c + (255 - c) * mix) for c in _rgb(fill(dbm)))
+
+
+def legend_svg(x, y, width, gid="sig"):
+    """A gradient bar with dBm ticks and words, for the bottom of a map (about 56 px tall)."""
+    stops = "".join(f'<stop offset="{i / (len(VIRIDIS) - 1):.2f}" stop-color="{c}"/>' for i, c in enumerate(VIRIDIS))
+    parts = [f'<defs><linearGradient id="{gid}" x1="0" y1="0" x2="1" y2="0">{stops}</linearGradient></defs>',
+             f'<rect x="{x}" y="{y}" width="{width}" height="16" rx="8" fill="url(#{gid})"/>']
+    for dbm in range(-90, -29, 10):
+        tx = x + width * strength(dbm)
+        anchor = "start" if dbm == -90 else "end" if dbm == -30 else "middle"
+        parts.append(f'<line x1="{tx:.1f}" y1="{y + 16}" x2="{tx:.1f}" y2="{y + 22}" stroke="#c9d6e3" stroke-width="2"/>'
+                     f'<text x="{tx:.1f}" y="{y + 40}" fill="#c9d6e3" font-size="17" text-anchor="{anchor}" '
+                     f'font-family="sans-serif">{dbm}</text>')
+    parts.append(f'<text x="{x}" y="{y - 6}" fill="#c9d6e3" font-size="17" font-family="sans-serif">weak</text>'
+                 f'<text x="{x + width}" y="{y - 6}" fill="#c9d6e3" font-size="17" text-anchor="end" '
+                 f'font-family="sans-serif">strong (dBm)</text>')
+    return "".join(parts)
 
 
 def band(freq):

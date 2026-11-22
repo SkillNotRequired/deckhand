@@ -34,7 +34,8 @@ MAX_SECONDS = 3600
 FLOOR_HEIGHT = 2.7   # metres between storeys (for splitting floors)
 EYE_HEIGHT = 1.6     # head above its floor, roughly
 WALL_HEIGHT = 2.4
-WALL_REACH = 0.55    # controller held this far out from the head (for 1 s+) = touching a wall
+WALL_REACH = 0.40    # without the trigger: arm raised and held this far out from the head ...
+AUTO_HOLD = 5        # ... for this many pose updates (5 a second): about 1 s
 LABELS = ["Router", "PC", "Bedroom", "Kitchen", "Living room", "Office", "Bathroom", "Garage", "Hall"]
 TARGETS = wifi_map.TARGETS
 
@@ -51,8 +52,11 @@ class HouseRecorder:
         self.samples, self.walls = [], []   # walls: [x, hand y, z, segment, head y, hand]
         self.pose = None                    # latest headset (x, y, z) or None
         self.heading = (0.0, -1.0)          # latest look direction on the floor (x, z)
-        self.trace_walls = True             # count a controller held out as a wall point
+        self.trace_walls = True             # record wall points (see _wall_check)
         self.hands = {}                     # "left"/"right" -> (x, y, z) when tracked
+        self.buttons = {}                   # "left"/"right" -> (trigger 0..1, pressed-button mask)
+        self.buttons_seen = False           # any button press ever came through (input reaches us)
+        self._k_time = 0.0                  # when SteamVR last gave us controller buttons
         self.latest = None                  # latest home Wi-Fi reading
         self.latest_dongle = None
         self.running = False
@@ -63,6 +67,7 @@ class HouseRecorder:
         self.iface = self.ap = None
         self._last = None
         self._held = {}
+        self._last_wall = {}
 
     def start(self, segment_offset=0):
         if not os.access(wifi_map.SPACE_TOOL, os.X_OK):
@@ -87,8 +92,19 @@ class HouseRecorder:
                         self.heading = (fx, fz)
                 elif pos:
                     self.hands[p[1]] = pos
+                    self._wall_check(p[1], pos)
                 else:
                     self.hands.pop(p[1], None)
+                    self._held[p[1]] = 0
+            elif len(p) == 4 and p[0] == "k":
+                try:
+                    trig, mask = float(p[2]), int(p[3], 16)
+                except ValueError:
+                    continue
+                self.buttons[p[1]] = (trig, mask)
+                self._k_time = time.time()
+                if trig > 0.05 or mask:
+                    self.buttons_seen = True
             if not self.running:
                 break
 
@@ -112,20 +128,42 @@ class HouseRecorder:
                 self.samples.append([round(pose[0], 2), round(pose[1], 2), round(pose[2], 2),
                                      s["dbm"] if s else None, s["tx"] if s else None, self.segment,
                                      d["dbm"] if d else None, d["tx"] if d else None])
-                for side, hand in (list(self.hands.items()) if self.trace_walls else []):  # held out ≥ 1 s = wall
-                    out = (math.hypot(hand[0] - pose[0], hand[2] - pose[2]) > WALL_REACH
-                           and pose[1] - 1.4 < hand[1] < pose[1] + 0.6)
-                    self._held[side] = self._held.get(side, 0) + 1 if out else 0
-                    if self._held[side] >= 2:
-                        self.walls.append([round(hand[0], 2), round(hand[1], 2), round(hand[2], 2), self.segment,
-                                           round(pose[1], 2), 0 if side == "left" else 1])
             time.sleep(0.5)
+
+    def trigger_ok(self):
+        """SteamVR is giving us controller buttons right now (not while the dashboard or a game has them)."""
+        return time.time() - self._k_time < 2.0
+
+    def pressed(self, side):
+        """Trigger (or grip) held on that controller."""
+        trig, mask = self.buttons.get(side, (0.0, 0))
+        return trig > 0.5 or bool(mask & ((1 << 33) | (1 << 2)))
+
+    def _wall_check(self, side, hand):
+        """Five times a second per controller: is it marking a wall? Either the trigger/grip is held
+        (instant), or the arm is raised and held out ≥ WALL_REACH from the head for about a second."""
+        pose = self.pose
+        if not (self.running and self.trace_walls and pose):
+            self._held[side] = 0
+            return
+        if self.pressed(side):
+            self._held[side] = max(self._held.get(side, 0), AUTO_HOLD) + 1
+        else:
+            out = (math.hypot(hand[0] - pose[0], hand[2] - pose[2]) > WALL_REACH
+                   and pose[1] - 0.8 < hand[1] < pose[1] + 0.5)
+            self._held[side] = self._held.get(side, 0) + 1 if out else 0
+        if self._held[side] >= AUTO_HOLD:
+            last = self._last_wall.get(side)
+            if last is None or math.hypot(hand[0] - last[0], hand[2] - last[1]) > 0.08:
+                self._last_wall[side] = (hand[0], hand[2])
+                self.walls.append([round(hand[0], 2), round(hand[1], 2), round(hand[2], 2), self.segment,
+                                   round(pose[1], 2), 0 if side == "left" else 1])
 
     def on_wall(self):
         """Hands being counted as on a wall right now: {"left"/"right": (x, y, z)}."""
         if not (self.running and self.trace_walls):
             return {}
-        return {side: pos for side, pos in list(self.hands.items()) if self._held.get(side, 0) >= 2}
+        return {side: pos for side, pos in list(self.hands.items()) if self._held.get(side, 0) >= AUTO_HOLD}
 
     def elapsed(self):
         return time.time() - self.started if self.started else 0
@@ -392,9 +430,11 @@ def export_glb(m, target="wifi", path=None):
         y0 = f * FLOOR_HEIGHT
         x0, z0 = i * CELL, j * CELL
         h = 0.1 + 1.2 * max(0.0, min(1.0, (dbm + 90) / 50))                      # -90 → 0.1 m, -40 → 1.3 m
-        word, colour = wifi_map.quality(dbm)
+        band = min(9, int(wifi_map.strength(dbm) * 10))         # 10 colour steps: one material each
+        lo = wifi_map.DBM_LOW + band * (wifi_map.DBM_HIGH - wifi_map.DBM_LOW) / 10
         g = 0.07
-        box(x0 + g, y0, z0 + g, x0 + CELL - g, y0 + h, z0 + CELL - g, f"{TARGETS[target]} {word}", colour)
+        box(x0 + g, y0, z0 + g, x0 + CELL - g, y0 + h, z0 + CELL - g, f"{TARGETS[target]} {lo:.0f} dBm",
+            wifi_map.fill(lo + 3))
     for f in floors(samples):
         y0 = f * FLOOR_HEIGHT
         for line in wall_lines(m, f):
@@ -465,7 +505,8 @@ def export_glb(m, target="wifi", path=None):
 
 
 # ------------------------------------------------------------- mini-map ---
-def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.0, hands=None, on_wall=None):
+def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.0, hands=None, on_wall=None,
+                hint=False):
     """Game-style mini-map around the headset, turned so your view direction is up: walked
     squares coloured by `target` signal (grey = not measured), walls, recent path, labels and
     you as an arrow in the middle. SVG text, size x size px, showing about `radius` metres.
@@ -500,9 +541,14 @@ def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.
         if math.hypot(x0 + CELL / 2 - px, z0 + CELL / 2 - pz) > reach:
             continue
         v = measured.get((f, i, j))
-        colour = wifi_map.quality(v[0])[1] if v else "#3a4654"
+        colour = wifi_map.fill(v[0]) if v else "#2a3440"
         parts.append(f'<polygon points="{pts(((x0, z0), (x0 + CELL, z0), (x0 + CELL, z0 + CELL), (x0, z0 + CELL)))}" '
-                     f'fill="{colour}" fill-opacity="0.7"/>')
+                     f'fill="{colour}" fill-opacity="0.85"/>')
+    for xa, za, xb, zb in outline_edges(samples, floor):  # estimated walls: edge of the walked area
+        if min(math.hypot(xa - px, za - pz), math.hypot(xb - px, zb - pz)) < reach:
+            (ax, ay), (bx, by) = P(xa, za), P(xb, zb)
+            parts.append(f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{bx:.1f}" y2="{by:.1f}" stroke="#9fd8ff" '
+                         f'stroke-width="3" stroke-dasharray="8 5"/>')
     recent = [(s[0], s[2]) for s in samples[-240:] if floor_of(s[1], base) == floor
               and math.hypot(s[0] - px, s[2] - pz) < reach]
     if len(recent) > 1:
@@ -537,7 +583,7 @@ def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.
         if lab.get("floor", 0) == floor and math.hypot(lab["x"] - px, lab["z"] - pz) < reach:
             lx, ly = P(lab["x"], lab["z"])
             parts.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="8" fill="#66ccff" stroke="#0e141b" stroke-width="3"/>'
-                         f'<text x="{lx:.1f}" y="{ly - 13:.1f}" fill="#ffffff" font-size="22" font-weight="bold" '
+                         f'<text x="{lx:.1f}" y="{ly + 30:.1f}" fill="#ffffff" font-size="22" font-weight="bold" '
                          f'text-anchor="middle" font-family="sans-serif" stroke="#0e141b" stroke-width="5" '
                          f'paint-order="stroke">{lab["name"]}</text>')
     parts.append("</g>")
@@ -553,6 +599,11 @@ def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.
         parts.append(f'<rect x="{c - 92:.1f}" y="{size - 70}" width="184" height="44" rx="22" fill="#66ccff"/>'
                      f'<text x="{c:.1f}" y="{size - 39}" fill="#0e141b" font-size="26" font-weight="bold" '
                      f'text-anchor="middle" font-family="sans-serif">Wall ✓</text>')
+    elif hint:  # how to draw a wall: "trigger" when SteamVR passes us the trigger, else "arm"
+        text = "Trigger on a wall: draw it" if hint == "trigger" else "Arm out on a wall: draw it"
+        parts.append(f'<rect x="{c - 150:.1f}" y="{size - 66}" width="300" height="38" rx="19" fill="#0e141b" '
+                     f'fill-opacity="0.85"/><text x="{c:.1f}" y="{size - 40}" fill="#c9d6e3" font-size="21" '
+                     f'text-anchor="middle" font-family="sans-serif">{text}</text>')
     parts.append(f'<line x1="{size - 30 - k:.1f}" y1="{size - 28}" x2="{size - 30}" y2="{size - 28}" stroke="#c9d6e3" '
                  f'stroke-width="5"/><text x="{size - 30 - k / 2:.1f}" y="{size - 38}" fill="#c9d6e3" font-size="20" '
                  f'text-anchor="middle" font-family="sans-serif">1 m</text>')

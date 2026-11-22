@@ -764,6 +764,7 @@ class FrameSettings(Gtk.Window):
         {"Power": self.refresh_power, "Comfort": self.refresh_comfort,
          "Recline": self.refresh_recline, "System": self.refresh_system,
          "Timer": self.tick_timer, "Rooms": self.refresh_rooms,
+         "System": lambda: (self.refresh_system(), None if self.upd_checked else self.on_update_check()),
          "Reminders": self.refresh_reminders, "Signal": self.refresh_signal,
          "WifiMap": lambda: self.refresh_wifi(full=True), "House": lambda: self.refresh_house(full=True),
          }.get(name, lambda: None)()
@@ -1721,7 +1722,7 @@ class FrameSettings(Gtk.Window):
                    f'font-family="sans-serif">No map yet: press Start mapping and walk around</text></svg>')
         else:
             minx, maxx, minz, maxz = min(xs), max(xs), min(zs), max(zs)
-            pad, foot = 28, 46
+            pad, foot = 28, 70
             s = min((w - 2 * pad) / max(maxx - minx, 0.5), (h - 2 * pad - foot) / max(maxz - minz, 0.5))
             ox = (w - (maxx - minx) * s) / 2
             oz = (h - foot - (maxz - minz) * s) / 2
@@ -1731,9 +1732,8 @@ class FrameSettings(Gtk.Window):
             parts = [f'<rect width="{w}" height="{h}" rx="14" fill="{bg}"/>']
             for (i, j), (dbm, _tx, _n) in cells.items():
                 x0, z0 = P(i * wifi_map.CELL, j * wifi_map.CELL)
-                colour = wifi_map.quality(dbm)[1]
                 parts.append(f'<rect x="{x0:.1f}" y="{z0:.1f}" width="{wifi_map.CELL * s:.1f}" '
-                             f'height="{wifi_map.CELL * s:.1f}" fill="{colour}" fill-opacity="0.75"/>')
+                             f'height="{wifi_map.CELL * s:.1f}" fill="{wifi_map.fill(dbm)}" fill-opacity="0.9"/>')
             if len(bounds) >= 3:
                 poly = " ".join(f"{px:.1f},{pz:.1f}" for px, pz in (P(x, z) for x, z in bounds))
                 parts.append(f'<polygon points="{poly}" fill="none" stroke="{ACCENT}" stroke-width="4" '
@@ -1750,10 +1750,7 @@ class FrameSettings(Gtk.Window):
                              f'<text x="{bx:.1f}" y="{bz - wifi_map.CELL * s * 0.6 - 6:.1f}" fill="#ffffff" '
                              f'font-size="24" font-weight="bold" text-anchor="middle" font-family="sans-serif">'
                              f'Best</text>')
-            legend = (f"{wifi_map.TARGETS[target]}: green excellent · lime good · yellow fair · orange weak · "
-                      "red poor · dot = room start")
-            parts.append(f'<text x="{w / 2}" y="{h - 14}" fill="#c9d6e3" font-size="17" text-anchor="middle" '
-                         f'font-family="sans-serif">{legend}</text>')
+            parts.append(wifi_map.legend_svg(pad + 8, h - 52, w - 2 * pad - 16))
             svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">{"".join(parts)}</svg>'
         loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
         loader.write(svg.encode())
@@ -1803,8 +1800,10 @@ class FrameSettings(Gtk.Window):
         self.house_prefs = house_map.prefs()
         self.wall_switch = Gtk.Switch(active=self.house_prefs["walls"])
         self.wall_switch.connect("notify::active", self.on_house_pref, "walls")
-        side.pack_start(switch_row("Wall detection", label("Hold a controller out against a wall as you walk "
-                                                           "along it to draw that wall.", "desc", wrap=True),
+        side.pack_start(switch_row("Wall detection", label("Touch a wall with a controller and hold the trigger "
+                                                           "while you walk along it. Holding your arm out at "
+                                                           "shoulder height for a second works too.",
+                                                           "desc", wrap=True),
                                    self.wall_switch), False, False, 0)
         self.minimap_switch = Gtk.Switch(active=self.house_prefs["minimap"])
         self.minimap_switch.connect("notify::active", self.on_house_pref, "minimap")
@@ -1817,13 +1816,20 @@ class FrameSettings(Gtk.Window):
         side.pack_start(self.house_progress, False, False, 0)
         self.house_result = label("", "status", wrap=True)
         side.pack_start(self.house_result, False, False, 0)
-        side.pack_start(label("Label the map: pick a name, then tap the map where it is.", "desc", wrap=True),
-                        False, False, 0)
-        self.house_label = Segmented([(n, n) for n in house_map.LABELS], lambda _v: None, per_row=3)
+        side.pack_start(label("Labels: choose what a tap on the map does", "card-title", wrap=True), False, False, 0)
+        self._label_sel = None    # index of the label being moved
+        self._label_undo = None   # labels before the last change
+        self.label_mode = Segmented([("add", "Add"), ("move", "Move"), ("rename", "Rename"),
+                                     ("delete", "Delete")], self.on_label_mode, per_row=2)
+        self.label_mode.set_value("add")
+        side.pack_start(self.label_mode, False, False, 0)
+        self.house_label = Segmented([(n, n) for n in house_map.LABELS], self.on_label_name, per_row=3)
         self.house_label.set_value("Router")
         side.pack_start(self.house_label, False, False, 0)
+        self.label_status = label("Add: pick a name, then tap the map where it is.", "status", wrap=True)
+        side.pack_start(self.label_status, False, False, 0)
         acts2 = Gtk.Box(spacing=10, homogeneous=True)
-        undo = Gtk.Button(label="Undo label")
+        undo = Gtk.Button(label="Undo")
         undo.connect("clicked", self.on_house_undo_label)
         acts2.pack_start(undo, True, True, 0)
         export = add_class(Gtk.Button(label="Export 3D model"), "primary")
@@ -1832,7 +1838,11 @@ class FrameSettings(Gtk.Window):
         side.pack_start(acts2, False, False, 0)
         self.house_export_lbl = label("", "desc", wrap=True, selectable=True)
         side.pack_start(self.house_export_lbl, False, False, 0)
-        row.pack_start(side, True, True, 0)
+        # The controls scroll on their own, so the map stays in view while you label it.
+        side_sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        side_sw.set_size_request(-1, 860)
+        side_sw.add(side)
+        row.pack_start(side_sw, True, True, 0)
         box.pack_start(row, False, False, 0)
         return box
 
@@ -1872,9 +1882,14 @@ class FrameSettings(Gtk.Window):
             line("Steam dongle", dongle, "not connected (PC dongle off or asleep)"))
         if rec and rec.running:
             el = int(rec.elapsed())
+            hint = ""
+            if not rec.pose:
+                hint = " · headset not tracking: put it on"
+            elif rec.trace_walls and not rec.trigger_ok() and el > 5:
+                hint = (" · the trigger only works with this window closed: close the dashboard, or hold "
+                        "a controller out against the wall at shoulder height")
             self.house_progress.set_text(f"Walking: {el // 60}:{el % 60:02d} · {rec.distance:.0f} m · "
-                                         f"{len(rec.samples)} readings · {len(rec.walls)} wall points" +
-                                         ("" if rec.pose else " · headset not tracking: put it on"))
+                                         f"{len(rec.samples)} readings · {len(rec.walls)} wall points" + hint)
             self.draw_house(house_map.add_walk(self.copy_house(), rec))
             return
         if full:
@@ -1900,11 +1915,12 @@ class FrameSettings(Gtk.Window):
             seg.set_value(self.house_floor)
             self.house_floor_box.pack_start(seg, True, True, 0)
             self.house_floor_box.show_all()
-        pix, self._house_xf = self.house_svg(m, self.house_floor, self.house_target)
+        pix, self._house_xf = self.house_svg(m, self.house_floor, self.house_target,
+                                             selected=getattr(self, "_label_sel", None))
         self.house_img.set_from_pixbuf(pix)
 
     @staticmethod
-    def house_svg(m, floor, target="wifi", w=820, h=740):
+    def house_svg(m, floor, target="wifi", w=820, h=740, selected=None):
         """Top-down map of one floor: 0.5 m squares by the chosen signal, traced walls (solid), the edge
         of the walked area (dashed), the path, labels, a 1 m scale. Returns (pixbuf, transform), the
         transform mapping image pixels back to metres for labelling."""
@@ -1914,11 +1930,11 @@ class FrameSettings(Gtk.Window):
         walked = {(i, j) for f, i, j in house_map.footprint(samples) if f == floor} if samples else set()
         cs = {(i, j): v for (f, i, j), v in house_map.cells(samples, target).items() if f == floor} if samples else {}
         walls = house_map.wall_lines(m, floor) if samples else []
-        labels = [l for l in m.get("labels", []) if l.get("floor", 0) == floor]
+        labels = [(i, l) for i, l in enumerate(m.get("labels", [])) if l.get("floor", 0) == floor]
         bg = "#141b24"
-        xs = ([(i + d) * house_map.CELL for (i, _j) in walked for d in (0, 1)] + [l["x"] for l in labels]
+        xs = ([(i + d) * house_map.CELL for (i, _j) in walked for d in (0, 1)] + [l["x"] for _i, l in labels]
               + [x for ln in walls for x, _z in ln] + [0])
-        zs = ([(j + d) * house_map.CELL for (_i, j) in walked for d in (0, 1)] + [l["z"] for l in labels]
+        zs = ([(j + d) * house_map.CELL for (_i, j) in walked for d in (0, 1)] + [l["z"] for _i, l in labels]
               + [z for ln in walls for _x, z in ln] + [0])
         xf = None
         if not walked:
@@ -1928,7 +1944,7 @@ class FrameSettings(Gtk.Window):
                    f'font-family="sans-serif">No house map yet: press Start walking</text></svg>')
         else:
             minx, maxx, minz, maxz = min(xs) - 0.5, max(xs) + 0.5, min(zs) - 0.5, max(zs) + 0.5
-            pad, foot = 20, 40
+            pad, foot = 20, 104
             s = min((w - 2 * pad) / (maxx - minx), (h - 2 * pad - foot) / (maxz - minz))
             ox = (w - (maxx - minx) * s) / 2
             oz = (h - foot - (maxz - minz) * s) / 2
@@ -1942,15 +1958,15 @@ class FrameSettings(Gtk.Window):
                 if (i, j) not in cs:
                     x0, z0 = P(i * house_map.CELL, j * house_map.CELL)
                     parts.append(f'<rect x="{x0:.1f}" y="{z0:.1f}" width="{cw:.1f}" height="{cw:.1f}" '
-                                 f'fill="#3a4654"/>')
+                                 f'fill="#2a3440"/>')
             for (i, j), (dbm, _tx, _n) in cs.items():
                 x0, z0 = P(i * house_map.CELL, j * house_map.CELL)
                 parts.append(f'<rect x="{x0:.1f}" y="{z0:.1f}" width="{cw:.1f}" height="{cw:.1f}" '
-                             f'fill="{wifi_map.quality(dbm)[1]}" fill-opacity="0.8"/>')
-            for xa, za, xb, zb in house_map.outline_edges(samples, floor):  # edge of the walked area
+                             f'fill="{wifi_map.fill(dbm)}" fill-opacity="0.9"/>')
+            for xa, za, xb, zb in house_map.outline_edges(samples, floor):  # estimated walls: edge of the walked area
                 (ax, az), (bx, bz) = P(xa, za), P(xb, zb)
-                parts.append(f'<line x1="{ax:.1f}" y1="{az:.1f}" x2="{bx:.1f}" y2="{bz:.1f}" stroke="#66ccff" '
-                             f'stroke-opacity="0.45" stroke-width="2" stroke-dasharray="6 5"/>')
+                parts.append(f'<line x1="{ax:.1f}" y1="{az:.1f}" x2="{bx:.1f}" y2="{bz:.1f}" stroke="#9fd8ff" '
+                             f'stroke-opacity="0.9" stroke-width="3" stroke-dasharray="9 6" stroke-linecap="round"/>')
             seg, pts = None, []
             for smp in on_floor + [[0, 0, 0, None, None, -1]]:  # path, one polyline per segment
                 x, z, sg = smp[0], smp[2], smp[5]
@@ -1968,17 +1984,24 @@ class FrameSettings(Gtk.Window):
             if floor == 0:
                 sx, sz = P(0, 0)
                 parts.append(f'<circle cx="{sx:.1f}" cy="{sz:.1f}" r="8" fill="#ffffff"/>')
-            for l in labels:
+            for idx, l in labels:  # a dot, its name underneath; the one being moved gets a ring
                 lx, lz = P(l["x"], l["z"])
+                if idx == selected:
+                    parts.append(f'<circle cx="{lx:.1f}" cy="{lz:.1f}" r="20" fill="none" stroke="#fde725" '
+                                 f'stroke-width="5"/>')
                 parts.append(f'<circle cx="{lx:.1f}" cy="{lz:.1f}" r="9" fill="{ACCENT}" stroke="#0e141b" '
-                             f'stroke-width="3"/><text x="{lx:.1f}" y="{lz - 14:.1f}" fill="#ffffff" '
+                             f'stroke-width="3"/><text x="{lx:.1f}" y="{lz + 32:.1f}" fill="#ffffff" '
                              f'font-size="22" font-weight="bold" text-anchor="middle" font-family="sans-serif" '
                              f'stroke="#0e141b" stroke-width="5" paint-order="stroke">{l["name"]}</text>')
-            bar = s  # 1 m scale bar
-            parts.append(f'<line x1="{pad}" y1="{h - 18}" x2="{pad + bar:.1f}" y2="{h - 18}" stroke="#c9d6e3" '
-                         f'stroke-width="4"/><text x="{pad + bar + 10:.1f}" y="{h - 11}" fill="#c9d6e3" '
-                         f'font-size="19" font-family="sans-serif">1 m · {house_map.TARGETS[target]}: green strong '
-                         f'→ red weak · white lines = walls · dot = start</text>')
+            bar = s  # 1 m scale bar, top left
+            parts.append(f'<rect x="{pad - 6}" y="{pad - 4}" width="{bar + 62:.1f}" height="34" rx="8" fill="{bg}" '
+                         f'fill-opacity="0.8"/><line x1="{pad + 2}" y1="{pad + 13}" x2="{pad + 2 + bar:.1f}" '
+                         f'y2="{pad + 13}" stroke="#c9d6e3" stroke-width="4"/><text x="{pad + bar + 10:.1f}" '
+                         f'y="{pad + 20}" fill="#c9d6e3" font-size="19" font-family="sans-serif">1 m</text>')
+            parts.append(f'<text x="{w / 2}" y="{h - 82}" fill="#c9d6e3" font-size="17" text-anchor="middle" '
+                         f'font-family="sans-serif">{house_map.TARGETS[target]} · white = traced walls · dashed = '
+                         f'estimated walls · grey = not measured · dot = start</text>')
+            parts.append(wifi_map.legend_svg(pad + 10, h - 50, w - 2 * pad - 20))
             svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">{"".join(parts)}</svg>'
         loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
         loader.write(svg.encode())
@@ -2118,7 +2141,9 @@ class FrameSettings(Gtk.Window):
         try:
             loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
             loader.write(house_map.minimap_svg(m, pose, rec.heading, self.house_target, caption,
-                                               hands=dict(rec.hands), on_wall=rec.on_wall()).encode())
+                                               hands=dict(rec.hands), on_wall=rec.on_wall(),
+                                               hint=rec.trace_walls and ("trigger" if rec.trigger_ok()
+                                                                         else "arm")).encode())
             loader.close()
             write_rgba(loader.get_pixbuf(), self.MINIMAP)
         except Exception:  # noqa: BLE001
@@ -2145,20 +2170,70 @@ class FrameSettings(Gtk.Window):
         py = event.y - (alloc.height - pix.get_height()) / 2
         minx, minz, s, ox, oz = self._house_xf
         x, z = (px - ox) / s + minx, (py - oz) / s + minz
-        m.setdefault("labels", []).append({"name": self.house_label.value or "Spot", "x": round(x, 2),
-                                           "z": round(z, 2), "floor": self.house_floor})
+        labels = m.setdefault("labels", [])
+        near, best = None, 40 / s  # a label within 40 px of the tap
+        for i, lab in enumerate(labels):
+            d = math.hypot(lab["x"] - x, lab["z"] - z)
+            if lab.get("floor", 0) == self.house_floor and d <= best:
+                near, best = i, d
+        mode, name = self.label_mode.value, self.house_label.value or "Spot"
+        before = [dict(lab) for lab in labels]
+        if mode == "add":
+            labels.append({"name": name, "x": round(x, 2), "z": round(z, 2), "floor": self.house_floor})
+            msg = f"Added {name}. Tap again to add another, or pick another name."
+        elif mode == "move" and self._label_sel is not None:
+            lab = labels[self._label_sel]
+            lab["x"], lab["z"] = round(x, 2), round(z, 2)
+            self._label_sel = None
+            msg = f"Moved {lab['name']}. Tap another label to move it."
+        elif near is None:
+            self.label_status.set_text("Tap right on a label's dot.")
+            return True
+        elif mode == "move":
+            self._label_sel = near
+            self.label_status.set_text(f"Moving {labels[near]['name']}: now tap where it goes.")
+            self.draw_house(m)
+            return True
+        elif mode == "rename":
+            old = labels[near]["name"]
+            labels[near]["name"] = name
+            msg = f"Renamed {old} to {name}."
+        else:
+            msg = f"Deleted {labels.pop(near)['name']}."
+        self._label_undo = before
+        self.label_status.set_text(msg)
         house_map.save(m)
         self.draw_house(m)
         self.show_house_result()
         return True
 
+    def on_label_mode(self, mode):
+        self._label_sel = None
+        self.label_status.set_text({
+            "add": "Add: pick a name, then tap the map where it is.",
+            "move": "Move: tap a label, then tap where it goes.",
+            "rename": "Rename: pick the new name, then tap the label.",
+            "delete": "Delete: tap the label to remove it."}[mode])
+        if self.house_m:
+            self.draw_house(self.house_m)
+
+    def on_label_name(self, name):
+        if self.label_mode.value == "add":
+            self.label_status.set_text(f"Tap the map where the {name} is.")
+        elif self.label_mode.value == "rename":
+            self.label_status.set_text(f"Tap the label to rename it {name}.")
+
     def on_house_undo_label(self, *_):
         m = self.house_m
-        if m and m.get("labels"):
-            m["labels"].pop()
+        if m and self._label_undo is not None:
+            m["labels"], self._label_undo = self._label_undo, None
+            self._label_sel = None
+            self.label_status.set_text("Undone.")
             house_map.save(m)
             self.draw_house(m)
             self.show_house_result()
+        else:
+            self.label_status.set_text("Nothing to undo.")
 
     def on_house_export(self, *_):
         if not self.house_m:
@@ -2484,10 +2559,17 @@ class FrameSettings(Gtk.Window):
                                  "timers stay as they are.")
         self.upd_lbl = label(f"Installed: version {updater.local_version()}", "status", wrap=True)
         upd.pack_start(self.upd_lbl, False, False, 0)
-        self.upd_btn = add_class(Gtk.Button(label="Check for updates"), "primary")
-        self.upd_btn.connect("clicked", self.on_update_button)
-        upd.pack_start(self.upd_btn, False, False, 0)
+        ubox = Gtk.Box(spacing=10, homogeneous=True)
+        self.upd_btn = Gtk.Button(label="Check for update")
+        self.upd_btn.connect("clicked", self.on_update_check)
+        ubox.pack_start(self.upd_btn, True, True, 0)
+        self.upd_go = add_class(Gtk.Button(label="Update"), "primary")
+        self.upd_go.connect("clicked", self.on_update_install)
+        self.upd_go.set_no_show_all(True)  # only once a newer version is found
+        ubox.pack_start(self.upd_go, True, True, 0)
+        upd.pack_start(ubox, False, False, 0)
         self.upd_new = None
+        self.upd_checked = False
         share = card("Share with a friend", "On their Steam Frame, in Desktop mode, open Konsole and paste:")
         cmd = label(f"curl -fsSL https://raw.githubusercontent.com/{updater.REPO}/main/install.sh | bash",
                     "status", wrap=True, selectable=True)
@@ -2497,20 +2579,8 @@ class FrameSettings(Gtk.Window):
         box.pack_start(label(f"Deckhand lives in {HERE}", "desc", wrap=True), False, False, 0)
         return box
 
-    def on_update_button(self, *_):
-        if self.upd_new:  # second tap: install
-            self.upd_btn.set_sensitive(False)
-            self.upd_lbl.set_text(f"Updating to version {self.upd_new}…")
-
-            def done(res):
-                self.upd_btn.set_sensitive(True)
-                if isinstance(res, Exception):
-                    set_result(self.upd_lbl, f"Update failed: {res}", False)
-                    return
-                set_result(self.upd_lbl, f"Updated to version {res}. Restarting the app…", True)
-                GLib.timeout_add(1500, self.restart_self)
-            in_background(lambda: updater.install(log=lambda _m: None), done)
-            return
+    def on_update_check(self, *_):
+        self.upd_checked = True
         self.upd_btn.set_sensitive(False)
         self.upd_lbl.set_text("Checking GitHub…")
 
@@ -2523,10 +2593,30 @@ class FrameSettings(Gtk.Window):
             if newer:
                 self.upd_new = there
                 set_result(self.upd_lbl, f"Version {there} is out (you have {here}).", True)
-                self.upd_btn.set_label(f"Update to {there}")
+                self.upd_go.set_label(f"Update to {there}")
+                self.upd_go.show()
             else:
+                self.upd_new = None
+                self.upd_go.hide()
                 set_result(self.upd_lbl, f"Up to date: version {here}.", True)
         in_background(updater.check, checked)
+
+    def on_update_install(self, *_):
+        if not self.upd_new:
+            return
+        self.upd_btn.set_sensitive(False)
+        self.upd_go.set_sensitive(False)
+        self.upd_lbl.set_text(f"Updating to version {self.upd_new}…")
+
+        def done(res):
+            self.upd_btn.set_sensitive(True)
+            self.upd_go.set_sensitive(True)
+            if isinstance(res, Exception):
+                set_result(self.upd_lbl, f"Update failed: {res}", False)
+                return
+            set_result(self.upd_lbl, f"Updated to version {res}. Restarting the app…", True)
+            GLib.timeout_add(1500, self.restart_self)
+        in_background(lambda: updater.install(log=lambda _m: None), done)
 
     def restart_self(self):
         """Starts the new version in place of this one (same process, so Steam still counts it as running)."""
