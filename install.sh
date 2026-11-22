@@ -1,6 +1,7 @@
 #!/bin/bash
 # Installs (or updates) Deckhand on a Steam Frame. In Desktop mode, open Konsole and run:
 #
+#   curl -L is.gd/deckhandvr|sh          (short link to this file)
 #   curl -fsSL https://raw.githubusercontent.com/SkillNotRequired/deckhand/main/install.sh | bash
 #
 # Puts the app in ~/Deckhand (or $DECKHAND_DIR), builds its small helpers, and adds it to

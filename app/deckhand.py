@@ -353,6 +353,7 @@ button.primary {{ background: #2a6f97; }}
 button.primary:hover {{ background: #3282b0; }}
 button.danger {{ background: #8a2f2f; font-size: 19pt; min-height: 92px; }}
 button.danger:hover {{ background: #a33939; }}
+.big-cmd {{ font-family: monospace; font-size: 20pt; font-weight: bold; color: #fde725; }}
 progressbar.hold trough {{ min-height: 16px; border-radius: 8px; background: #2c3b4b; }}
 progressbar.hold progress {{ min-height: 16px; border-radius: 8px; background: #f2a33a; }}
 button.armed {{ background: #d04040; }}
@@ -2628,13 +2629,15 @@ class FrameSettings(Gtk.Window):
         upd.pack_start(self.upd_restart, False, False, 0)
         self.upd_new = None
         self.upd_checked = False
-        share = card("Share with a friend", "On their Steam Frame, in Desktop mode, open Konsole and paste:")
-        self.share_cmd = f"curl -fsSL https://raw.githubusercontent.com/{updater.REPO}/main/install.sh | bash"
-        share.pack_start(label(self.share_cmd, "status", wrap=True, selectable=True), False, False, 0)
+        share = card("Share with a friend", "On their Steam Frame, in Desktop mode, open Konsole, type this "
+                                            "and press Enter:")
+        self.share_cmd = updater.INSTALL_SHORT
+        share.pack_start(label(self.share_cmd, "big-cmd", selectable=True), False, False, 0)
         self.share_copy = add_class(Gtk.Button(label="Copy to clipboard"), "primary")
         self.share_copy.connect("clicked", self.on_share_copy)
         share.pack_start(self.share_copy, False, False, 0)
-        share.pack_start(label(f"github.com/{updater.REPO}", "desc", selectable=True), False, False, 0)
+        share.pack_start(label(f"Same as the full command on github.com/{updater.REPO}", "desc", wrap=True,
+                               selectable=True), False, False, 0)
         box.pack_start(self.two_columns(upd, share), False, False, 0)
 
         rm = card("Remove Deckhand", "Uninstalls the app and everything it installed on this Frame.")

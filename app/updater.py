@@ -22,6 +22,9 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)  # the install folder (app/ is inside it)
 REPO = "SkillNotRequired/deckhand"
+# Short install command: is.gd/deckhandvr redirects to this repo's install.sh (permanent is.gd link)
+INSTALL_SHORT = "curl -L is.gd/deckhandvr|sh"
+INSTALL_FULL = f"curl -fsSL https://raw.githubusercontent.com/{REPO}/main/install.sh | bash"
 BRANCH = "main"
 VERSION_URL = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/VERSION"
 TARBALL_URL = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/{BRANCH}"

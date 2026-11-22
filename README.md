@@ -21,11 +21,14 @@ doesn't have (yet). Runs from your Steam library, in VR, no desktop mode needed.
 
 ## Install
 
-On the Frame, switch to **Desktop mode**, open **Konsole** and paste:
+On the Frame, switch to **Desktop mode**, open **Konsole**, type this and press Enter:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SkillNotRequired/deckhand/main/install.sh | bash
+curl -L is.gd/deckhandvr|sh
 ```
+
+(`is.gd/deckhandvr` is a short link to this repo's `install.sh`. The full command, if you'd rather paste it:
+`curl -fsSL https://raw.githubusercontent.com/SkillNotRequired/deckhand/main/install.sh | bash`)
 
 It installs into `~/Deckhand`, builds its small helpers (g++ ships with SteamOS on the Frame), and adds
 Deckhand to your Steam library and app menu. Then go back to Game mode and open it like any game.
