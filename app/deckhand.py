@@ -15,6 +15,7 @@ Uses only what SteamOS ships: Python 3 and GTK 3 (through PyGObject).
 Run it from the Steam library (works in VR), or with --snapshot PREFIX to
 render every page off-screen into PREFIX-<n>.png (for testing).
 """
+import html
 import json
 import math
 import os
@@ -819,7 +820,7 @@ class FrameSettings(Gtk.Window):
             ctx = b.get_style_context()
             (ctx.add_class if n == nav_name else ctx.remove_class)("active")
         {"Power": self.refresh_power, "Comfort": self.refresh_comfort,
-         "Recline": self.refresh_recline, "System": self.refresh_system,
+         "Recline": self.refresh_recline,
          "Timer": self.tick_timer, "Rooms": self.refresh_rooms,
          "System": lambda: (self.refresh_system(), self.show_restart_if_needed(),
                             None if self.upd_checked else self.on_update_check()),
@@ -1898,7 +1899,14 @@ class FrameSettings(Gtk.Window):
         self.house_label = Segmented([(n, n) for n in house_map.LABELS], self.on_label_name, per_row=3)
         self.house_label.set_value("Router")
         side.pack_start(self.house_label, False, False, 0)
-        self.label_status = label("Add: pick a name, then tap the map where it is.", "status", wrap=True)
+        self.label_custom = Gtk.Entry(placeholder_text="Or type your own name…", max_length=24)
+        self.label_custom.connect("changed", self.on_label_custom)
+        side.pack_start(self.label_custom, False, False, 0)
+        here = add_class(Gtk.Button(label="Label where I'm standing"), "primary")
+        here.connect("clicked", self.on_label_here)
+        side.pack_start(here, False, False, 0)
+        self.label_status = label("Add: pick a name, then tap the map where it is (also while walking).",
+                                  "status", wrap=True)
         side.pack_start(self.label_status, False, False, 0)
         acts2 = Gtk.Box(spacing=10, homogeneous=True)
         undo = Gtk.Button(label="Undo")
@@ -1944,6 +1952,8 @@ class FrameSettings(Gtk.Window):
 
     def on_house_target(self, target):
         self.house_target = target
+        if self.house_rec and self.house_rec.running:  # the mini-map / readout follow the choice at once
+            self.render_minimap() if self.house_prefs["minimap"] else self.render_house_hud()
         self.refresh_house(full=True)
 
     def house_live(self):
@@ -2184,7 +2194,7 @@ class FrameSettings(Gtk.Window):
                 parts.append(f'<circle cx="{lx:.1f}" cy="{lz:.1f}" r="9" fill="{ACCENT}" stroke="#0e141b" '
                              f'stroke-width="3"/><text x="{lx:.1f}" y="{lz + 32:.1f}" fill="#ffffff" '
                              f'font-size="22" font-weight="bold" text-anchor="middle" font-family="sans-serif" '
-                             f'stroke="#0e141b" stroke-width="5" paint-order="stroke">{l["name"]}</text>')
+                             f'stroke="#0e141b" stroke-width="5" paint-order="stroke">{html.escape(l["name"])}</text>')
             if here:  # you: a big arrow pointing where you look, with a ring and "You"
                 ux, uz = P(here[0], here[2])
                 fx, fz = here[3]
@@ -2358,16 +2368,18 @@ class FrameSettings(Gtk.Window):
 
         def short(s):
             return f"{s['dbm']:.0f}" if s and s.get("dbm") is not None else "--"
-        if self.house_target == "dongle":
-            caption = f"Dongle {short(rec.latest_dongle)} · Wi-Fi {short(rec.latest)}"
-        else:
-            caption = f"Wi-Fi {short(rec.latest)} · Dongle {short(rec.latest_dongle)}"
+        dongle = self.house_target == "dongle"
+        sel, oth = (rec.latest_dongle, rec.latest) if dongle else (rec.latest, rec.latest_dongle)
+        dbm = sel.get("dbm") if sel else None
+        word, colour = wifi_map.quality(dbm)
+        reading = {"name": house_map.TARGETS[self.house_target], "dbm": dbm, "word": word, "colour": colour,
+                   "other": f"{'Wi-Fi' if dongle else 'Dongle'} {short(oth)}"}
         if not rec.pose:
-            caption = "Not tracking"
+            reading["note"] = "Not tracking"
         m = house_map.add_walk(self.copy_house(), rec)
         try:
             loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
-            loader.write(house_map.minimap_svg(m, pose, rec.heading, self.house_target, caption).encode())
+            loader.write(house_map.minimap_svg(m, pose, rec.heading, self.house_target, reading).encode())
             loader.close()
             write_rgba(loader.get_pixbuf(), self.MINIMAP)
         except Exception:  # noqa: BLE001
@@ -2385,10 +2397,52 @@ class FrameSettings(Gtk.Window):
         self.draw_house({})
         self.show_house_result()
 
-    def on_house_tap(self, event):
-        m = self.house_m
-        if not m or not self._house_xf or (self.house_rec and self.house_rec.running):
+    def label_name(self):
+        return self.label_custom.get_text().strip() or self.house_label.value or "Spot"
+
+    def on_label_custom(self, entry):
+        if entry.get_text().strip():
+            self.house_label.set_value(None)  # the typed name wins
+            if self.label_mode.value in ("add", "rename"):
+                self.label_status.set_text(f"Using your name \"{entry.get_text().strip()}\".")
+        elif self.house_label.value is None:
+            self.house_label.set_value("Router")
+
+    def house_labels_map(self):
+        """The saved map labels live in (made on the first label of a first walk)."""
+        if self.house_m is None:
+            self.house_m = {"kind": "house", "samples": [], "labels": [], "distance": 0.0, "walks": 0}
+        return self.house_m
+
+    def redraw_house_live(self):
+        """The map as it is now: including the walk in progress."""
+        rec = self.house_rec
+        if rec and rec.running:
+            self.draw_house(house_map.add_walk(self.copy_house(), rec))
+            self.render_minimap() if self.house_prefs["minimap"] else None
+        else:
+            self.draw_house(self.house_m or {})
+
+    def on_label_here(self, *_):
+        you = self.house_you()
+        if not you:
+            set_result(self.label_status, "Your position isn't known right now: wear the headset (and walk or "
+                                          "keep this page open a moment).", False)
             return
+        m = self.house_labels_map()
+        samples = list(m.get("samples", [])) + (list(self.house_rec.samples) if self.house_rec else [])
+        floor = house_map.floor_of(you[1], house_map.floor_base(samples)) if samples else 0
+        name = self.label_name()
+        self._label_undo = [dict(lab) for lab in m.setdefault("labels", [])]
+        m["labels"].append({"name": name, "x": round(you[0], 2), "z": round(you[2], 2), "floor": floor})
+        house_map.save(m)
+        set_result(self.label_status, f"Added {name} where you're standing.", True)
+        self.redraw_house_live()
+
+    def on_house_tap(self, event):
+        if not self._house_xf:
+            return
+        m = self.house_labels_map()
         xf = self._house_xf
         x, z = self.house_view_metres(xf, *self._map_xy(event))
         labels = m.setdefault("labels", [])
@@ -2397,7 +2451,7 @@ class FrameSettings(Gtk.Window):
             d = math.hypot(lab["x"] - x, lab["z"] - z)
             if lab.get("floor", 0) == self.house_floor and d <= best:
                 near, best = i, d
-        mode, name = self.label_mode.value, self.house_label.value or "Spot"
+        mode, name = self.label_mode.value, self.label_name()
         before = [dict(lab) for lab in labels]
         if mode == "add":
             labels.append({"name": name, "x": round(x, 2), "z": round(z, 2), "floor": self.house_floor})
@@ -2413,7 +2467,7 @@ class FrameSettings(Gtk.Window):
         elif mode == "move":
             self._label_sel = near
             self.label_status.set_text(f"Moving {labels[near]['name']}: now tap where it goes.")
-            self.draw_house(m)
+            self.redraw_house_live()
             return
         elif mode == "rename":
             old = labels[near]["name"]
@@ -2424,8 +2478,9 @@ class FrameSettings(Gtk.Window):
         self._label_undo = before
         self.label_status.set_text(msg)
         house_map.save(m)
-        self.draw_house(m)
-        self.show_house_result()
+        self.redraw_house_live()
+        if not (self.house_rec and self.house_rec.running):
+            self.show_house_result()
 
     def on_label_mode(self, mode):
         self._label_sel = None
@@ -2435,9 +2490,11 @@ class FrameSettings(Gtk.Window):
             "rename": "Rename: pick the new name, then tap the label.",
             "delete": "Delete: tap the label to remove it."}[mode])
         if self.house_m:
-            self.draw_house(self.house_m)
+            self.redraw_house_live()
 
     def on_label_name(self, name):
+        if self.label_custom.get_text():
+            self.label_custom.set_text("")  # a picked name replaces a typed one
         if self.label_mode.value == "add":
             self.label_status.set_text(f"Tap the map where the {name} is.")
         elif self.label_mode.value == "rename":
@@ -2450,7 +2507,7 @@ class FrameSettings(Gtk.Window):
             self._label_sel = None
             self.label_status.set_text("Undone.")
             house_map.save(m)
-            self.draw_house(m)
+            self.redraw_house_live()
             self.show_house_result()
         else:
             self.label_status.set_text("Nothing to undo.")
@@ -2946,12 +3003,27 @@ class FrameSettings(Gtk.Window):
             set_result(self.upd_lbl, f"Couldn't restart ({e}). Close Deckhand and open it again.", False)
         return False
 
+    @staticmethod
+    def colour_camera():
+        """True/False: is the colour passthrough camera accessory connected (its kernel driver says
+        present=1)? None if this headset doesn't report it."""
+        try:
+            with open("/sys/bus/i2c/drivers/arcimx616/0-001a/led_status", encoding="utf-8") as f:
+                m = re.search(r"present=(\d)", f.read())
+        except OSError:
+            return None
+        return (m.group(1) == "1") if m else None
+
     def refresh_system(self):
         pct, chg = battery()
         lines = [f"Battery: {pct}%" + (" (charging)" if chg else "") if pct is not None else "Battery: unknown",
                  f"Name: {socket.gethostname()}",
                  "Network:\n  " + "\n  ".join(ip_addresses()),
                  "SteamVR: " + ("running" if steamvr_running() else "not running")]
+        cam = self.colour_camera()
+        if cam is not None:
+            lines.append("Colour passthrough camera: " + ("connected" if cam else
+                         "NOT DETECTED: take it off, reattach it firmly, then restart SteamVR"))
         self.sys_lbl.set_text("\n".join(lines))
 
     def do_restart_steamvr(self):
@@ -2982,8 +3054,10 @@ def snapshot(prefix):
     if win.house_m:  # the mini-map, as it would look in the middle of the house walk
         smp = win.house_m["samples"][len(win.house_m["samples"]) // 2]
         loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        word, colour = wifi_map.quality(-61)
         loader.write(house_map.minimap_svg(win.house_m, (smp[0], smp[1], smp[2]), (0.6, -0.8), "wifi",
-                                           "Wi-Fi -61 · Dongle -53").encode())
+                                           {"name": "Home Wi-Fi", "dbm": -61, "word": word, "colour": colour,
+                                            "other": "Dongle -53"}).encode())
         loader.close()
         loader.get_pixbuf().savev(f"{prefix}-minimap.png", "png", [], [])
         print(f"wrote {prefix}-minimap.png")

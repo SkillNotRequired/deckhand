@@ -12,6 +12,7 @@ chosen signal, the edge of where you walked, your path, labels) and a simple 3D 
 Tracking can jump if the Frame re-recognises a room; a jump over 2 m starts a new
 path segment instead of drawing a line across the house.
 """
+import html
 import json
 import math
 import os
@@ -430,11 +431,15 @@ def export_glb(m, target="wifi", path=None):
 
 
 # ------------------------------------------------------------- mini-map ---
-def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.0):
-    """Game-style mini-map around the headset, turned so your view direction is up: walked
-    squares coloured by `target` signal (grey = not measured), your recent path, labels and
-    you as an arrow in the middle. SVG text, size x size px, showing about `radius` metres.
-    It sits in the middle of your view, so the background is see-through."""
+HEADER = 150  # mini-map: height of the big signal readout on top, pixels
+
+
+def minimap_svg(m, pose, heading, target="wifi", reading=None, size=420, radius=5.0):
+    """Game-style mini-map for the middle of your view, see-through. On top, the chosen link's signal
+    in big numbers (reading: {"name", "dbm", "word", "colour", "other", "note"}); below, the map around
+    the headset, turned so your view direction is up: walked squares coloured by `target` signal (grey =
+    not measured), your recent path, labels and you as an arrow in the middle (about `radius` metres).
+    SVG text, size x (HEADER + size) px."""
     samples = m.get("samples") or []
     c = size / 2
     k = (size / 2 - 16) / radius          # px per metre
@@ -451,6 +456,16 @@ def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.
     base = floor_base(samples) if samples else py
     floor = floor_of(py, base)
     reach = radius * 1.5
+    r = reading or {}
+    head = [f'<rect x="4" y="4" width="{size - 8}" height="{HEADER - 10}" rx="26" fill="#0e141b" fill-opacity="0.8" '
+            f'stroke="#66ccff" stroke-opacity="0.8" stroke-width="4"/>']
+    title = r.get("name", TARGETS[target]).upper() + (f" · {r['word']}" if r.get("dbm") is not None else "")
+    head.append(f'<text x="{c:.1f}" y="44" fill="#c9d6e3" font-size="24" font-weight="bold" text-anchor="middle" '
+                f'font-family="sans-serif">{title}</text>')
+    big = r.get("note") or (f"{r['dbm']:.0f} dBm" if r.get("dbm") is not None else "no signal")
+    head.append(f'<text x="{c:.1f}" y="{HEADER - 30}" fill="{r.get("colour", "#ffffff") if not r.get("note") else "#ffffff"}" '
+                f'font-size="66" font-weight="bold" text-anchor="middle" font-family="sans-serif" stroke="#0e141b" '
+                f'stroke-width="6" paint-order="stroke">{big}</text>')
     parts = [f'<defs><clipPath id="r"><rect x="4" y="4" width="{size - 8}" height="{size - 8}" rx="34"/>'
              f'</clipPath></defs>',
              f'<rect x="4" y="4" width="{size - 8}" height="{size - 8}" rx="34" fill="#0e141b" fill-opacity="0.6"/>',
@@ -477,17 +492,19 @@ def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.
             parts.append(f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="8" fill="#66ccff" stroke="#0e141b" stroke-width="3"/>'
                          f'<text x="{lx:.1f}" y="{ly + 30:.1f}" fill="#ffffff" font-size="22" font-weight="bold" '
                          f'text-anchor="middle" font-family="sans-serif" stroke="#0e141b" stroke-width="5" '
-                         f'paint-order="stroke">{lab["name"]}</text>')
+                         f'paint-order="stroke">{html.escape(lab["name"])}</text>')
     parts.append("</g>")
     parts.append(f'<polygon points="{c:.1f},{c - 22:.1f} {c + 15:.1f},{c + 16:.1f} {c:.1f},{c + 8:.1f} '
-                 f'{c - 15:.1f},{c + 16:.1f}" fill="#ffffff" stroke="#0e141b" stroke-width="4" '
+                 f'{c - 15:.1f},{c + 16:.1f}" fill="#fde725" stroke="#0e141b" stroke-width="4" '
                  f'stroke-linejoin="round"/>')
     parts.append(f'<rect x="4" y="4" width="{size - 8}" height="{size - 8}" rx="34" fill="none" stroke="#66ccff" '
                  f'stroke-opacity="0.8" stroke-width="5"/>')
-    if caption:
-        parts.append(f'<text x="{c:.1f}" y="44" fill="#ffffff" font-size="26" font-weight="bold" text-anchor="middle" '
-                     f'font-family="sans-serif" stroke="#0e141b" stroke-width="6" paint-order="stroke">{caption}</text>')
     parts.append(f'<line x1="{size - 30 - k:.1f}" y1="{size - 28}" x2="{size - 30}" y2="{size - 28}" stroke="#c9d6e3" '
                  f'stroke-width="5"/><text x="{size - 30 - k / 2:.1f}" y="{size - 38}" fill="#c9d6e3" font-size="20" '
                  f'text-anchor="middle" font-family="sans-serif">1 m</text>')
-    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}">{"".join(parts)}</svg>'
+    if r.get("other"):  # the other link, small, bottom left
+        parts.append(f'<text x="28" y="{size - 24}" fill="#c9d6e3" font-size="24" font-weight="bold" '
+                     f'font-family="sans-serif" stroke="#0e141b" stroke-width="5" paint-order="stroke">'
+                     f'{html.escape(r["other"])}</text>')
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{HEADER + size}">{"".join(head)}'
+            f'<g transform="translate(0,{HEADER})">{"".join(parts)}</g></svg>')
