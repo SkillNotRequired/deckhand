@@ -1,0 +1,2611 @@
+#!/usr/bin/env python3
+"""Deckhand: a small settings app for the Steam Frame.
+
+Full-screen, phone-style pages (big text and buttons for VR):
+- Fan: live fan speed, temperatures and battery; presets (Stock, Quiet,
+  Extra quiet) and a custom minimum speed + strength. Changing it calls the
+  root helper installed by setup.sh.
+- Power: shut down now, sleep timer, auto shut-off after standby (power.py).
+- Comfort: SteamVR Do Not Disturb, screens-off timer, theater surroundings
+  brightness, screenshots.
+- Recline: Recline VR status, recline / back-to-normal buttons.
+- System: battery, network address, restart SteamVR.
+
+Uses only what SteamOS ships: Python 3 and GTK 3 (through PyGObject).
+Run it from the Steam library (works in VR), or with --snapshot PREFIX to
+render every page off-screen into PREFIX-<n>.png (for testing).
+"""
+import json
+import math
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+# Window class "deckhand" (instead of "frame_settings.py") so taskbars match
+# the window to frame-settings.desktop (StartupWMClass) and show its icon.
+GLib.set_prgname("deckhand")
+GLib.set_application_name("Deckhand")
+Gdk.set_program_class("deckhand")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+APP_ICON = os.path.join(HERE, "assets", "steam", "icon.png")
+sys.path.insert(0, HERE)
+import power  # noqa: E402  (same folder: shutdown, sleep timer, auto shut-off)
+import kitchen_timer  # noqa: E402  (countdown popup in the headset)
+import rooms  # noqa: E402  (saved play areas, experimental)
+import reminders  # noqa: E402  (reminders at a time and date)
+import wifi_map  # noqa: E402  (Wi-Fi signal map of the play space)
+import ceiling  # noqa: E402  (ceiling indicator)
+import house_map  # noqa: E402  (whole-house Wi-Fi walk + 3D model)
+import updater  # noqa: E402  (Update app: newest version from GitHub)
+import datetime  # noqa: E402
+import struct  # noqa: E402
+
+HELPER = "/etc/frame-settings/fanmode"
+HELPER_MIN_VERSION = 3
+STOCK_CFG = "/usr/share/deckard-fan-control/deckard-config.yaml"
+QUIET_CFG = "/etc/deckard-fan-control-quiet/deckard-config.yaml"
+QUIET_DROPIN = "/etc/systemd/system/deckard-fan-control.service.d/quiet.conf"
+FAN_LOG = "/var/log/deckard-fan-control.log"
+FAN_HWMON_NAME = "slg4ax46073v"
+OPENVR_PATHS = os.path.expanduser("~/.config/openvr/openvrpaths.vrpath")
+RECLINECTL = os.path.expanduser("~/.local/share/recline-vr/bin/linuxarm64/reclinectl")
+FLOOR_MAX = 55
+SHOT_TOOLTIP = (
+    "<b>How to take a screenshot</b>\n"
+    "Hold the <b>Steam button</b> on either controller and pull a <b>trigger</b>\n"
+    "(either trigger works).\n\n"
+    "<b>Where they go</b>\n"
+    "Steam on the headset: <b>Media</b>.\n"
+    "Files: ~/.local/share/Steam/userdata/&lt;id&gt;/760/remote/250820/screenshots\n\n"
+    "Turn <b>Disable screenshots</b> on to block them, e.g. if you keep taking them by accident.")
+PRESETS = {  # name: (floor, charging floor, strength %) ; None = Valve stock
+    "Stock": None,
+    "Quiet": (0, 0, 100),
+    "Extra quiet": (0, 0, 70),
+}
+
+
+def read(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def run(cmd, timeout=10, env=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def vr_tool_env():
+    """Environment for SteamVR command-line tools (vrcmd, reclinectl).
+
+    Launched from Steam, this app carries SteamAppId/SteamGameId; a tool that
+    inherits them connects to SteamVR *as this app*, and SteamVR then reloads
+    the app's controller input on every call, which froze the window. A plain
+    environment makes them ordinary background tools.
+    """
+    keep = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "XDG_RUNTIME_DIR")
+    return {k: os.environ[k] for k in keep if k in os.environ}
+
+
+# ---------------------------------------------------------------- fan ---
+def fan_hwmon():
+    base = "/sys/class/hwmon"
+    try:
+        for name in os.listdir(base):
+            if read(os.path.join(base, name, "name")) == FAN_HWMON_NAME:
+                return os.path.join(base, name)
+    except OSError:
+        pass
+    return None
+
+
+def fan_mode():
+    """('stock'|'custom', floor, charging_floor, strength)"""
+    if os.path.exists(QUIET_DROPIN):
+        text = read(QUIET_CFG, "") or ""
+        tag = re.search(r"frame-settings: floor=(\d+) charging=(\d+) strength=(\d+)", text)
+        if tag:
+            return ("custom", *map(int, tag.groups()))
+        floor = re.search(r"^fan_min_speed:\s*(\d+)", text, re.M)
+        chg = re.search(r"^fan_charging_min_speed:\s*(\d+)", text, re.M)
+        return "custom", int(floor.group(1)) if floor else 0, int(chg.group(1)) if chg else 0, 100
+    text = read(STOCK_CFG, "") or ""
+    floor = re.search(r"^fan_min_speed:\s*(\d+)", text, re.M)
+    chg = re.search(r"^fan_charging_min_speed:\s*(\d+)", text, re.M)
+    return "stock", int(floor.group(1)) if floor else 30, int(chg.group(1)) if chg else 40, 100
+
+
+def battery():
+    """(percent or None, charging bool)"""
+    pct, chg = None, False
+    try:
+        names = os.listdir("/sys/class/power_supply")
+    except OSError:
+        return None, False
+    for n in names:
+        p = f"/sys/class/power_supply/{n}"
+        if read(f"{p}/type") == "Battery" and read(f"{p}/capacity", "").isdigit():
+            pct = int(read(f"{p}/capacity"))
+        if read(f"{p}/status") == "Charging":
+            chg = True
+    return pct, chg
+
+
+def fan_log_temps():
+    """Hottest CPU and GPU temperature from the last line of the fan service log."""
+    try:
+        with open(FAN_LOG, "rb") as f:
+            first = f.readline().decode("utf-8", "replace").strip()  # CSV header
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None, None
+    if not first.startswith("TIMESTAMP"):
+        return None, None
+    data = next((l for l in reversed(lines) if l and l[0].isdigit() and l.count(",") == first.count(",")), None)
+    if not data:
+        return None, None
+    row = dict(zip(first.split(","), data.split(",")))
+
+    def hottest(prefix):
+        vals = []
+        for k, v in row.items():
+            if re.fullmatch(prefix + r"\d+_TEMP", k):
+                try:
+                    vals.append(float(v))
+                except ValueError:
+                    pass
+        return max(vals) if vals else None
+    return hottest("C"), hottest("G")
+
+
+def fan_status():
+    h = fan_hwmon()
+    rpm = read(os.path.join(h, "fan1_input")) if h else None
+    cpu, gpu = fan_log_temps()
+    pct, chg = battery()
+    return {"rpm": int(rpm) if rpm and rpm.isdigit() else None,
+            "cpu": cpu, "gpu": gpu, "battery": pct, "charging": chg}
+
+
+def helper_version():
+    """Helper version if sudo lets us run it without a password, else 0."""
+    if not (os.path.isfile(HELPER) and os.access(HELPER, os.X_OK)):
+        return 0
+    rc, out = run(["sudo", "-n", HELPER, "check"])
+    if rc != 0:
+        return 0
+    m = re.search(r"ok\s*(\d+)?", out)
+    return int(m.group(1) or 1) if m else 0
+
+
+def run_helper(args):
+    rc, out = run(["sudo", "-n", HELPER, *args], timeout=30)
+    if rc != 0 and "password" in out.lower():
+        out = "setup isn't finished: press Run setup now."
+    return rc == 0, out
+
+
+# ----------------------------------------------------- SteamVR settings ---
+def openvr_paths():
+    try:
+        with open(OPENVR_PATHS, encoding="utf-8") as f:
+            d = json.load(f)
+        return (d.get("runtime") or ["/opt/steamvr"])[0], (d.get("config") or [None])[0]
+    except (OSError, ValueError):
+        return "/opt/steamvr", os.path.expanduser("~/.config/openvr/config")
+
+
+def vrcmd_path():
+    runtime, _ = openvr_paths()
+    for arch in ("linuxarm64", "linux64"):
+        p = os.path.join(runtime, "bin", arch, "vrcmd")
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def vrsettings_path():
+    _, cfg = openvr_paths()
+    return os.path.join(cfg, "steamvr.vrsettings") if cfg else None
+
+
+def steamvr_running():
+    return run(["pgrep", "-x", "vrserver"])[0] == 0
+
+
+_DEFAULTS = None
+
+
+def vr_defaults():
+    """SteamVR's built-in defaults (default.vrsettings, which has // comments)."""
+    global _DEFAULTS
+    if _DEFAULTS is None:
+        runtime, _ = openvr_paths()
+        try:
+            with open(os.path.join(runtime, "resources", "settings", "default.vrsettings"), encoding="utf-8") as f:
+                _DEFAULTS = json.loads(re.sub(r"(?m)^\s*//.*$", "", f.read()))
+        except (OSError, ValueError):
+            _DEFAULTS = {}
+    return _DEFAULTS
+
+
+def vr_get(section, key, kind, default):
+    """kind: 'bool' | 'int' | 'float'. Reads SteamVR's settings file (SteamVR
+    saves every change to it right away), falling back to SteamVR's defaults.
+    No SteamVR connection, so it is instant and can't disturb anything."""
+    conv = {"bool": bool, "int": int, "float": float}[kind]
+    try:
+        with open(vrsettings_path(), encoding="utf-8") as f:
+            user = json.load(f).get(section, {})
+        if key in user:
+            return conv(user[key])
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        return conv(vr_defaults().get(section, {}).get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
+def vr_set(section, key, kind, value):
+    if steamvr_running() and vrcmd_path():
+        # vrcmd parses values as numbers: a bool must be sent as 1/0 ("true" would become 0).
+        arg = ("1" if value else "0") if kind == "bool" else str(value)
+        run([vrcmd_path(), f"--set-settings-{kind}", f"{section}.{key}", arg], env=vr_tool_env())
+        for _ in range(10):  # SteamVR writes the file a moment later
+            if vr_get(section, key, kind, None) == value if kind != "float" else \
+                    abs((vr_get(section, key, kind, -1.0)) - float(value)) < 1e-3:
+                return True
+            time.sleep(0.1)
+    else:
+        path = vrsettings_path()
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        data.setdefault(section, {})[key] = {"bool": bool, "int": int, "float": float}[kind](value)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=3)
+        os.replace(tmp, path)
+    got = vr_get(section, key, kind, None)
+    return got == value if kind != "float" else got is not None and abs(got - float(value)) < 1e-3
+
+
+# ------------------------------------------------------------- recline ---
+def recline_available():
+    return os.access(RECLINECTL, os.X_OK)
+
+
+def recline_status():
+    if not recline_available():
+        return "Recline VR is not installed."
+    if not steamvr_running():
+        return "SteamVR is not running."
+    rc, out = run([RECLINECTL, "status"], env=vr_tool_env())
+    loaded = re.search(r"status:\s*(.+)", out)
+    rot = re.search(r"^R:\s*yaw\s*(-?[\d.]+)\s*pitch\s*(-?[\d.]+)\s*roll\s*(-?[\d.]+)", out, re.M)
+    lines = [f"Driver: {loaded.group(1).replace('Driver: ', '')}" if loaded else "Driver: unknown"]
+    if rot:
+        pitch, roll = abs(float(rot.group(2))), abs(float(rot.group(3)))
+        lines.append(f"Reclined (pitch {pitch:.0f}°, roll {roll:.0f}°)" if max(pitch, roll) > 1 else "Normal (not reclined)")
+    return "\n".join(lines)
+
+
+# -------------------------------------------------------------- system ---
+def ip_addresses():
+    rc, out = run(["ip", "-4", "-o", "addr", "show", "scope", "global"])
+    addrs = re.findall(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)", out, re.M)
+    return [f"{ip}  ({dev})" for dev, ip in addrs] or ["no network"]
+
+
+# ----------------------------------------------------------------- UI ---
+# Big, phone-style layout for reading and pointing in VR: full screen,
+# side navigation, cards, large buttons and switches, no dropdowns or pop-ups.
+from gi.repository import Gdk, GdkPixbuf, Pango  # noqa: E402
+
+ACCENT = "#66ccff"
+CSS = f"""
+window, .root {{ background: #141b24; color: #eef4fa; font-size: 16pt; }}
+.rail {{ background: #0e141b; padding: 22px 16px; }}
+.app-title {{ font-size: 21pt; font-weight: bold; }}
+.rail-status {{ font-size: 13pt; color: #9fb3c8; }}
+.nav {{ border-radius: 18px; padding: 4px 18px; min-height: 54px; background: transparent;
+        border: none; box-shadow: none; color: #c9d6e3; }}
+.nav:hover {{ background: #1d2733; }}
+.nav.active {{ background: #22384d; color: #ffffff; }}
+.nav label {{ font-size: 18pt; font-weight: bold; }}
+.page {{ padding: 30px 34px; }}
+.page-title {{ font-size: 26pt; font-weight: bold; }}
+.card {{ background: #1f2a36; border-radius: 22px; padding: 26px 28px; }}
+.card-title {{ font-size: 19pt; font-weight: bold; }}
+.desc {{ font-size: 13pt; color: #a9bccd; }}
+.big {{ font-size: 40pt; font-weight: bold; }}
+.status {{ font-size: 15pt; color: #c9d6e3; }}
+.ok {{ color: #5fd68a; }}
+.err {{ color: #ff7b72; }}
+button {{ min-height: 64px; border-radius: 16px; padding: 8px 22px; font-size: 16pt;
+          background: #2c3b4b; color: #eef4fa; border: 2px solid transparent; box-shadow: none; }}
+button:hover {{ background: #36495d; }}
+button.primary {{ background: #2a6f97; }}
+button.primary:hover {{ background: #3282b0; }}
+button.danger {{ background: #8a2f2f; font-size: 19pt; min-height: 92px; }}
+button.danger:hover {{ background: #a33939; }}
+button.armed {{ background: #d04040; }}
+button.selected {{ background: #22384d; border-color: {ACCENT}; color: #ffffff; }}
+button.tile {{ padding: 16px 22px; min-height: 130px; }}
+.tile-name {{ font-size: 20pt; font-weight: bold; }}
+.tile-desc {{ font-size: 13pt; color: #b9cad9; }}
+button.step {{ min-width: 72px; font-size: 22pt; font-weight: bold; padding: 4px; }}
+button.seg {{ padding: 8px 2px; min-width: 0; }}
+switch {{ min-width: 116px; min-height: 58px; border-radius: 29px; }}
+switch slider {{ min-width: 54px; min-height: 54px; border-radius: 27px; }}
+scale trough {{ min-height: 14px; border-radius: 7px; }}
+scale slider {{ min-width: 46px; min-height: 46px; border-radius: 23px; }}
+scale value {{ font-size: 17pt; }}
+entry {{ font-size: 13pt; min-height: 52px; }}
+tooltip, tooltip * {{ font-size: 14pt; }}
+.hud {{ background: #0f1620; border: 5px solid {ACCENT}; padding: 10px 20px; }}
+.hud-name {{ font-size: 46px; font-weight: bold; color: #9fd8ff; }}
+.hud-time {{ font-size: 132px; font-weight: bold; color: #ffffff; }}
+.hud-done {{ font-size: 90px; font-weight: bold; color: #ffcf5c; }}
+.hud-note {{ font-size: 60px; font-weight: bold; color: #ffcf5c; }}
+.spin-value {{ font-size: 26pt; font-weight: bold; }}
+""".encode()
+
+
+_CSS_LOADED = False
+
+
+def ensure_css():
+    global _CSS_LOADED
+    if not _CSS_LOADED:
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        _CSS_LOADED = True
+
+
+def label(text="", css=None, wrap=False, markup=False, selectable=False, xalign=0.0):
+    lab = Gtk.Label(xalign=xalign)
+    lab.set_markup(text) if markup else lab.set_text(text)
+    lab.set_line_wrap(wrap)
+    lab.set_selectable(selectable)
+    for c in (css or "").split():
+        lab.get_style_context().add_class(c)
+    return lab
+
+
+def add_class(widget, *classes):
+    for c in classes:
+        widget.get_style_context().add_class(c)
+    return widget
+
+
+def card(title=None, desc=None):
+    box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16), "card")
+    if title:
+        box.pack_start(label(title, "card-title"), False, False, 0)
+    if desc:
+        box.pack_start(label(desc, "desc", wrap=True), False, False, 0)
+    return box
+
+
+def icon_image(names, size=48):
+    if isinstance(names, str) and names.endswith(".png") and os.path.isfile(names):
+        pix = GdkPixbuf.Pixbuf.new_from_file_at_size(names, size, size)
+        return Gtk.Image.new_from_pixbuf(pix)
+    theme = Gtk.IconTheme.get_default()
+    for n in ([names] if isinstance(names, str) else names):
+        if theme.has_icon(n):
+            img = Gtk.Image.new_from_icon_name(n, Gtk.IconSize.DIALOG)
+            img.set_pixel_size(size)
+            return img
+    return Gtk.Box()
+
+
+def set_result(lab, text, ok):
+    ctx = lab.get_style_context()
+    ctx.remove_class("ok")
+    ctx.remove_class("err")
+    ctx.add_class("ok" if ok else "err")
+    lab.set_text(text)
+
+
+def in_background(work, done):
+    """Runs work() off the UI thread, then done(result) on it."""
+    def runner():
+        try:
+            result = work()
+        except Exception as e:  # noqa: BLE001
+            result = e
+        GLib.idle_add(lambda: (done(result), False)[1])
+    threading.Thread(target=runner, daemon=True).start()
+
+
+def switch_row(title, desc_label, switch):
+    """Title + description on the left, a big switch on the right."""
+    row = Gtk.Box(spacing=20)
+    texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    texts.pack_start(label(title, "card-title"), False, False, 0)
+    texts.pack_start(desc_label, False, False, 0)
+    row.pack_start(texts, True, True, 0)
+    switch.set_valign(Gtk.Align.CENTER)
+    row.pack_end(switch, False, False, 0)
+    return row
+
+
+def write_rgba(pix, path):
+    """Saves a pixbuf as raw RGBA with an 8-byte (width, height) header, for timer_overlay."""
+    if not pix.get_has_alpha():
+        pix = pix.add_alpha(False, 0, 0, 0)
+    w, h, stride = pix.get_width(), pix.get_height(), pix.get_rowstride()
+    data = pix.get_pixels()
+    rows = b"".join(data[y * stride:y * stride + w * 4] for y in range(h))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(struct.pack("<II", w, h) + rows)
+    os.replace(tmp, path)
+
+
+class Segmented(Gtk.Box):
+    """Rows of big buttons where one is selected (replaces dropdowns). per_row splits long lists."""
+
+    def __init__(self, choices, on_pick, per_row=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.choices = list(choices)  # [(value, text)]
+        self.on_pick = on_pick
+        self.buttons = []
+        per_row = per_row or len(self.choices)
+        row = None
+        for i, (value, text) in enumerate(self.choices):
+            if i % per_row == 0:
+                row = Gtk.Box(spacing=10, homogeneous=True)
+                self.pack_start(row, False, False, 0)
+            b = add_class(Gtk.Button(label=text), "seg")
+            b.connect("clicked", self._clicked, value)
+            row.pack_start(b, True, True, 0)
+            self.buttons.append(b)
+        for _ in range(-len(self.choices) % per_row):  # keep the last row's buttons the same width
+            row.pack_start(Gtk.Box(), True, True, 0)
+        self.value = None
+
+    def set_value(self, value):
+        self.value = value
+        for (v, _), b in zip(self.choices, self.buttons):
+            ctx = b.get_style_context()
+            (ctx.add_class if v == value else ctx.remove_class)("selected")
+
+    def _clicked(self, _b, value):
+        self.set_value(value)
+        self.on_pick(value)
+
+
+class Stepper(Gtk.Box):
+    """[−] slider [+]: big step buttons because dragging is fiddly in VR."""
+
+    def __init__(self, adj, step, marks=None, on_change=None):
+        super().__init__(spacing=12)
+        self.adj, self.step, self.on_change = adj, step, on_change
+        minus = add_class(Gtk.Button(label="−"), "step")
+        plus = add_class(Gtk.Button(label="+"), "step")
+        minus.connect("clicked", lambda *_: self.bump(-1))
+        plus.connect("clicked", lambda *_: self.bump(+1))
+        self.scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj, hexpand=True)
+        self.scale.set_digits(0)
+        self.scale.set_draw_value(False)  # shown in its own label, so the knob never covers it
+        for v, t in (marks or {}).items():
+            self.scale.add_mark(v, Gtk.PositionType.BOTTOM, t)
+        if on_change:
+            self.scale.connect("button-release-event", lambda *_: (on_change(), False)[1])
+        self.value_lbl = label("", "card-title", xalign=1.0)
+        self.value_lbl.set_width_chars(4)
+        adj.connect("value-changed", lambda a: self.value_lbl.set_text(f"{a.get_value():.0f}"))
+        self.value_lbl.set_text(f"{adj.get_value():.0f}")
+        self.pack_start(minus, False, False, 0)
+        self.pack_start(self.scale, True, True, 0)
+        self.pack_start(self.value_lbl, False, False, 0)
+        self.pack_start(plus, False, False, 0)
+
+    def bump(self, direction):
+        self.adj.set_value(self.adj.get_value() + direction * self.step)
+        if self.on_change:
+            self.on_change()
+
+
+class Spin(Gtk.Box):
+    """[−] value [+] with a big value in the middle; wraps around (hours, minutes, days)."""
+
+    def __init__(self, lo, hi, step, value, fmt=str, on_change=None, wrap=True, width_chars=3):
+        super().__init__(spacing=10)
+        self.lo, self.hi, self.step, self.value, self.fmt, self.wrap = lo, hi, step, value, fmt, wrap
+        self.on_change = on_change
+        minus = add_class(Gtk.Button(label="−"), "step")
+        plus = add_class(Gtk.Button(label="+"), "step")
+        minus.connect("clicked", lambda *_: self.bump(-1))
+        plus.connect("clicked", lambda *_: self.bump(+1))
+        self.lbl = label("", "spin-value", xalign=0.5)
+        self.lbl.set_width_chars(width_chars)
+        self.pack_start(minus, False, False, 0)
+        self.pack_start(self.lbl, True, True, 0)
+        self.pack_start(plus, False, False, 0)
+        self.set(value)
+
+    def set(self, value, notify=False):
+        self.value = value
+        self.lbl.set_text(self.fmt(value))
+        if notify and self.on_change:
+            self.on_change(value)
+
+    def bump(self, direction):
+        v = self.value + direction * self.step
+        if v > self.hi:
+            v = self.lo if self.wrap else self.hi
+        elif v < self.lo:
+            v = (self.hi - (self.hi - self.lo) % self.step) if self.wrap else self.lo
+        self.set(v, notify=True)
+
+
+class ConfirmButton(Gtk.Button):
+    """Tap once to arm, tap again within 5 s to do it (no small pop-up dialogs)."""
+
+    def __init__(self, text, armed_text, action, css="danger"):
+        super().__init__(label=text)
+        self.text, self.armed_text, self.action = text, armed_text, action
+        add_class(self, css)
+        self.armed_until = 0
+        self.connect("clicked", self._clicked)
+
+    def _clicked(self, *_):
+        if time.time() < self.armed_until:
+            self.disarm()
+            self.action()
+            return
+        self.armed_until = time.time() + 5
+        self.set_label(self.armed_text)
+        add_class(self, "armed")
+        GLib.timeout_add(5000, self.disarm)
+
+    def disarm(self):
+        self.armed_until = 0
+        self.set_label(self.text)
+        self.get_style_context().remove_class("armed")
+        return False
+
+
+class HudRenderer:
+    """Draws the headset popup pictures (pixel sizes, not DPI) as raw RGBA files for
+    timer_overlay: 8-byte header (uint32 width, height, little endian) + pixels."""
+
+    def __enter__(self):
+        ensure_css()  # the popup's look, even when no app window exists yet
+        self.off = Gtk.OffscreenWindow()
+        self.hud = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0), "hud")
+        self.hud.set_size_request(640, 230)
+        self.name = label("", "hud-name", xalign=0.5)
+        self.name.set_ellipsize(Pango.EllipsizeMode.END)  # long names: "Lasagna in the ov…", popup stays 640 px
+        self.name.set_max_width_chars(22)
+        self.big = None
+        self.style = None
+        self.hud.pack_start(self.name, False, False, 0)
+        self.off.add(self.hud)
+        self.off.show_all()
+        return self
+
+    def __exit__(self, *_):
+        self.off.destroy()
+
+    def _settle(self, rounds=1):
+        for i in range(rounds):
+            self.off.queue_resize() if rounds > 1 else None
+            self.off.queue_draw()
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+            if self.off.get_window():
+                self.off.get_window().process_updates(True)
+            if rounds > 1:
+                time.sleep(0.01)
+
+    def render(self, title, big, path, done=False):
+        self.name.set_text(title)
+        long_text = len(big) > 10  # a reminder's own words: smaller and wrapped
+        style = "hud-note" if long_text else "hud-done" if done else "hud-time"
+        new_label = style != self.style
+        if new_label:
+            # A new label per style: GTK keeps the old text size when a label's style class changes.
+            if self.big:
+                self.hud.remove(self.big)
+            self.big = label("", style, xalign=0.5, wrap=long_text)
+            self.big.set_justify(Gtk.Justification.CENTER)
+            self.hud.pack_start(self.big, True, True, 0)
+            self.big.show()
+            self.style = style
+        self.big.set_text(big)
+        # The offscreen window repaints one step late: settle, grab once to flush, then grab for real.
+        # A freshly added label also needs a few layout passes first.
+        self._settle(8 if new_label else 1)
+        self.off.get_pixbuf()
+        self._settle(8 if new_label else 1)
+        write_rgba(self.off.get_pixbuf(), path)
+
+
+class FrameSettings(Gtk.Window):
+    PAGES = [("Fan", os.path.join(HERE, "assets", "steam", "icon.png")),
+             ("Power", ["system-shutdown"]),
+             ("Timer", ["chronometer", "alarm-symbolic", "appointment-soon", "preferences-system-time"]),
+             ("Reminders", ["appointment-new", "x-office-calendar", "office-calendar", "view-calendar"]),
+             ("Comfort", ["weather-clear-night", "preferences-desktop-display"]),
+             ("Rooms", ["go-home", "user-home", "view-grid"]),
+             ("Signal", ["network-wireless-signal-excellent-symbolic", "network-wireless", "network-wireless-symbolic",
+                         "network-wireless-signal-excellent"]),
+             ("Recline", ["object-rotate-left", "go-bottom"]),
+             ("System", ["preferences-system"])]
+    TIMER_MINUTES = [1, 2, 3, 5, 10, 15, 20, 30, 45, 60]
+    TIMER_LABELS = ["Timer", "Food", "Pizza", "Laundry", "Break"]
+    TIMER_CHOICES = [15, 30, 45, 60, 90, 120]
+    IDLE_CHOICES = [0, 5, 10, 15, 30, 60]
+    SCREEN_CHOICES = [1, 2, 5, 10, 15, 30, 60]
+
+    def __init__(self, offscreen=False):
+        super().__init__(title="Deckhand")
+        try:
+            Gtk.Window.set_default_icon_from_file(APP_ICON)  # taskbar / window switcher icon
+            self.set_icon_from_file(APP_ICON)
+        except GLib.Error:
+            self.set_icon_name("deckhand")
+        screen = Gdk.Screen.get_default()
+        self.set_default_size(screen.get_width(), screen.get_height())
+        ensure_css()
+        self.busy = False
+        self.loading = False
+        self.focused = True
+        self.setup_version = helper_version()
+        self.setup_poll_until = 0.0
+
+        self.content = add_class(Gtk.Box(), "root")
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=120)
+        self.content.pack_start(self.build_rail(), False, False, 0)
+        builders = {"Fan": self.build_fan, "Power": self.build_power, "Timer": self.build_timer,
+                    "Reminders": self.build_reminders,
+                    "Comfort": self.build_comfort, "Rooms": self.build_rooms, "Signal": self.build_signal,
+                    "Recline": self.build_recline, "System": self.build_system}
+        for name, _icon in self.PAGES:
+            sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            sw.add(builders[name]())
+            self.stack.add_named(sw, name)
+        for name, build in (("RoomPreview", self.build_room_preview_page), ("WifiMap", self.build_wifi_page),
+                            ("House", self.build_house_page), ("Ceiling", self.build_ceiling_page)):
+            sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            sw.add(build())
+            self.stack.add_named(sw, name)  # sub-pages of Rooms / Signal (no menu entry)
+        self.content.pack_start(self.stack, True, True, 0)
+        if not offscreen:
+            self.add(self.content)
+            self.connect("destroy", self.on_close)
+        self.refresh_fan_mode()
+        self.refresh_comfort()
+        self.refresh_power()
+        self.refresh_live()
+        self.show_page("Fan")
+        # Light on battery: live numbers every 3 s, the timer clock every 1 s only while its page
+        # shows, and nothing at all while the window isn't focused (refreshed again on return).
+        self.connect("focus-out-event", self.on_focus_change, False)
+        self.connect("focus-in-event", self.on_focus_change, True)
+        GLib.timeout_add_seconds(3, self.refresh_live)
+        GLib.timeout_add(1000, self.tick_timer)
+
+    def on_close(self, *_):
+        if getattr(self, "wifi_rec", None):  # don't leave the in-view readout or tracking running
+            self.stop_wifi_mapping()
+        if getattr(self, "house_rec", None):
+            self.stop_house_walk()
+        Gtk.main_quit()
+
+    def on_focus_change(self, _w, _ev, focused):
+        self.focused = focused
+        if focused:
+            self.refresh_live()
+            self.show_page(self.stack.get_visible_child_name())
+        return False
+
+    # ============================================================== rail
+    def build_rail(self):
+        rail = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10), "rail")
+        rail.set_size_request(330, -1)
+        head = Gtk.Box(spacing=14, margin_bottom=18)
+        head.pack_start(icon_image(os.path.join(HERE, "assets", "steam", "icon.png"), 64), False, False, 0)
+        head.pack_start(label("Deckhand", "app-title"), False, False, 0)
+        rail.pack_start(head, False, False, 0)
+        self.nav = {}
+        for name, icon in self.PAGES:
+            b = add_class(Gtk.Button(), "nav")
+            inner = Gtk.Box(spacing=18)
+            inner.pack_start(icon_image(icon, 44), False, False, 0)
+            inner.pack_start(label(name), False, False, 0)
+            b.add(inner)
+            b.connect("clicked", lambda _b, n=name: self.show_page(n))
+            rail.pack_start(b, False, False, 0)
+            self.nav[name] = b
+        close = Gtk.Button(label="Close")
+        close.connect("clicked", lambda *_: self.destroy())
+        rail.pack_end(close, False, False, 0)
+        self.rail_status = label("", "rail-status", wrap=True)
+        rail.pack_end(self.rail_status, False, False, 12)
+        return rail
+
+    def show_page(self, name):
+        self.stack.set_visible_child_name(name)
+        nav_name = {"RoomPreview": "Rooms", "Ceiling": "Rooms", "WifiMap": "Signal", "House": "Signal"}.get(name, name)
+        for n, b in self.nav.items():
+            ctx = b.get_style_context()
+            (ctx.add_class if n == nav_name else ctx.remove_class)("active")
+        {"Power": self.refresh_power, "Comfort": self.refresh_comfort,
+         "Recline": self.refresh_recline, "System": self.refresh_system,
+         "Timer": self.tick_timer, "Rooms": self.refresh_rooms,
+         "Reminders": self.refresh_reminders, "Signal": self.refresh_signal,
+         "WifiMap": lambda: self.refresh_wifi(full=True), "House": lambda: self.refresh_house(full=True),
+         }.get(name, lambda: None)()
+
+    def page(self, title):
+        box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=22), "page")
+        box.pack_start(label(title, "page-title"), False, False, 0)
+        return box
+
+    @staticmethod
+    def two_columns(*cards_):
+        grid = Gtk.Grid(column_spacing=22, row_spacing=22, column_homogeneous=True)
+        for i, c in enumerate(cards_):
+            grid.attach(c, i % 2, i // 2, 1, 1)
+        return grid
+
+    # ================================================================ fan
+    def build_fan(self):
+        box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=22), "page")
+        header = Gtk.Box(spacing=30)
+        header.pack_start(label("Fan", "page-title"), False, False, 0)
+        self.rpm_lbl = label("–", "big")
+        header.pack_end(self.rpm_lbl, False, False, 0)
+        live = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.CENTER)
+        self.temps_lbl = label("", "status", xalign=1.0, wrap=True)
+        self.mode_lbl = label("", "desc", xalign=1.0, wrap=True)
+        self.temps_lbl.set_justify(Gtk.Justification.RIGHT)
+        self.mode_lbl.set_justify(Gtk.Justification.RIGHT)
+        live.pack_start(self.temps_lbl, False, False, 0)
+        live.pack_start(self.mode_lbl, False, False, 0)
+        header.pack_end(live, True, True, 0)
+        box.pack_start(header, False, False, 0)
+
+        presets = card("Presets", "Tap one. The Frame has one fan; it is the air you feel on your face.")
+        tiles = Gtk.Box(spacing=18, homogeneous=True)
+        self.preset_btns = {}
+        descs = {"Stock": "Valve's default.\nNever below 30 (40 charging).",
+                 "Quiet": "No minimum.\nFollows temperature.",
+                 "Extra quiet": "No minimum, 70% strength.\nLeast air, runs warmer."}
+        for name in PRESETS:
+            b = add_class(Gtk.Button(), "tile")
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.CENTER)
+            inner.pack_start(label(name, "tile-name", xalign=0.5), False, False, 0)
+            inner.pack_start(label(descs[name], "tile-desc", xalign=0.5, wrap=True), False, False, 0)
+            b.add(inner)
+            b.connect("clicked", self.on_preset, name)
+            tiles.pack_start(b, True, True, 0)
+            self.preset_btns[name] = b
+        presets.pack_start(tiles, False, False, 0)
+        box.pack_start(presets, False, False, 0)
+
+        custom = card("Custom", "Set your own. Lower strength = less air but a warmer headset. "
+                                "Above 95 °C the fan always goes to full speed.")
+        self.floor_adj = Gtk.Adjustment(value=0, lower=0, upper=FLOOR_MAX, step_increment=1, page_increment=5)
+        self.strength_adj = Gtk.Adjustment(value=100, lower=50, upper=100, step_increment=5, page_increment=10)
+        grid = Gtk.Grid(column_spacing=18, row_spacing=14)
+        grid.attach(label("Minimum speed", "status"), 0, 0, 1, 1)
+        grid.attach(Stepper(self.floor_adj, 5, {30: "stock"}), 1, 0, 1, 1)
+        grid.attach(label("Strength %", "status"), 0, 1, 1, 1)
+        grid.attach(Stepper(self.strength_adj, 5), 1, 1, 1, 1)
+        custom.pack_start(grid, False, False, 0)
+        act = Gtk.Box(spacing=18)
+        self.apply_btn = add_class(Gtk.Button(label="Apply custom"), "primary")
+        self.apply_btn.connect("clicked", self.on_apply_custom)
+        act.pack_start(self.apply_btn, False, False, 0)
+        self.fan_result = label("", "status", wrap=True)
+        act.pack_start(self.fan_result, True, True, 0)
+        custom.pack_start(act, False, False, 0)
+
+        self.setup_box = card("Setup needed")
+        self.setup_msg = label("", "desc", wrap=True)
+        self.setup_box.pack_start(self.setup_msg, False, False, 0)
+        setup_btn = add_class(Gtk.Button(label="Run setup now"), "primary")
+        setup_btn.connect("clicked", self.on_run_setup)
+        self.setup_box.pack_start(setup_btn, False, False, 0)
+        cmd = Gtk.Entry()
+        cmd.set_text(f"sudo {os.path.join(HERE, 'setup.sh')}")
+        cmd.set_editable(False)
+        self.setup_box.pack_start(cmd, False, False, 0)
+
+        row = Gtk.Box(spacing=22, homogeneous=False)
+        row.pack_start(custom, True, True, 0)
+        row.pack_start(self.setup_box, True, True, 0)
+        box.pack_start(row, False, False, 0)
+        return box
+
+    @property
+    def setup_ready(self):
+        return self.setup_version >= HELPER_MIN_VERSION
+
+    def show_setup(self, visible):
+        if self.setup_version == 0:
+            msg = "Needed once before the fan can be changed. It asks for your password one time."
+        else:
+            msg = "Needed for the newest fan and power options. It asks for your password once more."
+        self.setup_msg.set_text(msg)
+        self.setup_box.set_no_show_all(not visible)
+        if visible:
+            self.setup_box.show_all()
+        else:
+            self.setup_box.hide()
+
+    def refresh_fan_mode(self):
+        mode, floor, chg, strength = fan_mode()
+        active = "Stock" if mode == "stock" else \
+            next((n for n, p in PRESETS.items() if p == (floor, chg, strength)), None)
+        if mode == "stock":
+            text = f"Now: Stock (minimum {floor}, {chg} while charging)"
+        else:
+            text = f"Now: {active or 'Custom'} (minimum {floor}" + \
+                   (f", {chg} while charging" if chg != floor else "") + f", strength {strength}%)"
+            self.floor_adj.set_value(floor)
+            self.strength_adj.set_value(strength)
+        self.mode_lbl.set_text(text)
+        for n, b in self.preset_btns.items():
+            ctx = b.get_style_context()
+            (ctx.add_class if n == active else ctx.remove_class)("selected")
+        self.show_setup(not self.setup_ready)
+
+    def refresh_live(self):
+        if not self.focused and time.time() >= self.setup_poll_until:
+            return True  # in the background: do nothing until focused again
+        s = fan_status()
+        self.rpm_lbl.set_text(f"{s['rpm']:,} rpm" if s["rpm"] is not None else "fan: n/a")
+        parts = []
+        if s["cpu"] is not None:
+            parts.append(f"CPU {s['cpu']:.0f} °C")
+        if s["gpu"] is not None:
+            parts.append(f"GPU {s['gpu']:.0f} °C")
+        bat = f"Battery {s['battery']}%" if s["battery"] is not None else "Battery"
+        parts.append(bat + (" (charging)" if s["charging"] else ""))
+        self.temps_lbl.set_text("   ·   ".join(parts))
+        self.rail_status.set_text(f"{bat}{' (charging)' if s['charging'] else ''}\n"
+                                  f"Fan {s['rpm']:,} rpm" if s["rpm"] is not None else bat)
+        page = self.stack.get_visible_child_name()  # live signal readings, only while their page is open
+        if page == "WifiMap" and not (self.wifi_rec and self.wifi_rec.running):
+            self.refresh_wifi()
+        elif page == "House" and not (self.house_rec and self.house_rec.running):
+            self.refresh_house()
+        elif page == "Signal":
+            self.refresh_signal()
+        if self.stack.get_visible_child_name() == "Power":
+            self.refresh_power_status()
+        if not self.setup_ready and time.time() < self.setup_poll_until:
+            self.setup_version = helper_version()
+            if self.setup_ready:
+                self.setup_poll_until = 0.0
+                self.show_setup(False)
+                set_result(self.fan_result, "Setup done. Pick a preset.", True)
+        return True
+
+    def apply_fan(self, args, what):
+        if self.busy:
+            return
+        if not self.setup_ready:
+            set_result(self.fan_result, "Run the setup first (on the right).", False)
+            self.show_setup(True)
+            return
+        self.busy = True
+        self.apply_btn.set_sensitive(False)
+        set_result(self.fan_result, f"Applying {what}…", True)
+
+        def done(result):
+            self.busy = False
+            self.apply_btn.set_sensitive(True)
+            ok, out = result if isinstance(result, tuple) else (False, str(result))
+            if not ok and "setup" in out:
+                self.setup_version = 0
+            set_result(self.fan_result, f"{what}: done" if ok else f"Failed: {out}", ok)
+            self.refresh_fan_mode()
+        in_background(lambda: run_helper(args), done)
+
+    def on_preset(self, _btn, name):
+        p = PRESETS[name]
+        self.apply_fan(["off"] if p is None else ["on", *map(str, p)], name)
+
+    def on_apply_custom(self, *_):
+        floor = int(self.floor_adj.get_value())
+        strength = int(self.strength_adj.get_value())
+        self.apply_fan(["on", str(floor), str(floor), str(strength)], "Custom")
+
+    def on_run_setup(self, *_):
+        """Opens a terminal running the setup, so the password is typed there (never here)."""
+        setup = os.path.join(HERE, "setup.sh")
+        for term in (["konsole", "--hold", "-e"], ["xterm", "-hold", "-e"]):
+            try:
+                subprocess.Popen([*term, "sudo", setup], start_new_session=True)
+                self.setup_poll_until = time.time() + 300
+                set_result(self.fan_result, "Type your password in the terminal that opened, then close it.", True)
+                return
+            except OSError:
+                continue
+        set_result(self.fan_result, "No terminal found; run the command shown yourself.", False)
+
+    # ============================================================== power
+    def build_power(self):
+        box = self.page("Power")
+        box.pack_start(label("Taking the Frame off or tapping the power button only puts it in standby "
+                             "(screens off). It stays on and drains the battery. Shut it down here, "
+                             "or let it shut itself down.", "desc", wrap=True), False, False, 0)
+        box.pack_start(ConfirmButton("Shut down now", "Tap again to shut down", self.do_shutdown),
+                       False, False, 0)
+
+        timer = card("Sleep timer", "Tap a time to start. Shuts down when it runs out "
+                                    "(with a warning one minute before).")
+        self.timer_seg = Segmented([(m, f"{m}") for m in self.TIMER_CHOICES], self.on_timer_pick)
+        timer.pack_start(self.timer_seg, False, False, 0)
+        timer.pack_start(label("minutes", "desc", xalign=0.5), False, False, 0)
+        self.timer_lbl = label("", "status", wrap=True)
+        timer.pack_start(self.timer_lbl, False, False, 0)
+        cancel = Gtk.Button(label="Cancel timer")
+        cancel.connect("clicked", self.on_timer_cancel)
+        timer.pack_start(cancel, False, False, 0)
+
+        auto = card("Auto shut-off", "Shuts down after the headset has been in standby (off your head) "
+                                     "this long. Putting it back on restarts the count.")
+        self.idle_seg = Segmented([(m, "Off" if m == 0 else f"{m}") for m in self.IDLE_CHOICES],
+                                  self.on_idle_pick)
+        auto.pack_start(self.idle_seg, False, False, 0)
+        auto.pack_start(label("minutes in standby", "desc", xalign=0.5), False, False, 0)
+        self.charge_switch = Gtk.Switch()
+        self.charge_switch.connect("notify::active", self.on_charge_toggled)
+        auto.pack_start(switch_row("Not while charging", label("Plugged in? Then stay on.", "desc"),
+                                   self.charge_switch), False, False, 0)
+        self.power_status_lbl = label("", "status", wrap=True)
+        auto.pack_start(self.power_status_lbl, False, False, 0)
+
+        box.pack_start(self.two_columns(timer, auto), False, False, 0)
+        self.power_result = label("", "status", wrap=True)
+        box.pack_start(self.power_result, False, False, 0)
+        return box
+
+    def refresh_power(self):
+        cfg = power.load_config()
+        self.loading = True
+        self.idle_seg.set_value(int(cfg.get("idle_off_minutes") or 0))
+        self.charge_switch.set_active(bool(cfg.get("skip_while_charging", True)))
+        self.loading = False
+        self.refresh_power_status()
+
+    def refresh_power_status(self):
+        cfg = power.load_config()
+        deadline = cfg.get("timer_deadline")
+        if deadline and deadline > time.time():
+            left = int((deadline - time.time()) / 60) + 1
+            self.timer_lbl.set_text(f"Shuts down at {time.strftime('%H:%M', time.localtime(deadline))} "
+                                    f"(in about {left} min)")
+        else:
+            self.timer_lbl.set_text("No timer running")
+            self.timer_seg.set_value(None)
+        st = power.read_status()
+        now = time.time()
+        if now - getattr(self, "_svc_checked", 0) > 15:  # asking systemd launches a process: not every tick
+            self._svc_active = power.service_active()
+            self._svc_checked = now
+        running = self._svc_active
+        lines = ["Auto shut-off: " + ("on duty" if running else "service not running")]
+        if running and st:
+            if st.get("standby_since"):
+                lines.append(f"Headset in standby for {int((time.time() - st['standby_since']) / 60)} min")
+            elif st.get("steamvr"):
+                lines.append("Headset in use")
+        self.power_status_lbl.set_text("\n".join(lines))
+
+    def power_change(self, mutate, message):
+        cfg = power.load_config()
+        mutate(cfg)
+        power.save_config(cfg)
+
+        def done(result):
+            ok, out = result if isinstance(result, tuple) else (False, str(result))
+            set_result(self.power_result, message if ok else f"Saved, but {out}", ok)
+            self.refresh_power_status()
+        in_background(power.ensure_service, done)
+
+    def do_shutdown(self):
+        set_result(self.power_result, "Shutting down…", True)
+        in_background(lambda: power.shutdown("Shut down now (Deckhand)"),
+                      lambda _r: set_result(self.power_result, "Shutdown failed: see power.log", False))
+
+    def on_timer_pick(self, m):
+        deadline = time.time() + m * 60
+        self.power_change(lambda c: c.update(timer_deadline=deadline),
+                          f"Sleep timer: shuts down at {time.strftime('%H:%M', time.localtime(deadline))}")
+
+    def on_timer_cancel(self, *_):
+        self.timer_seg.set_value(None)
+        self.power_change(lambda c: c.update(timer_deadline=None), "Sleep timer cancelled")
+
+    def on_idle_pick(self, m):
+        self.power_change(lambda c: c.update(idle_off_minutes=m),
+                          "Auto shut-off off" if m == 0 else f"Auto shut-off after {m} min in standby")
+
+    def on_charge_toggled(self, sw, _pspec):
+        if not self.loading:
+            on = sw.get_active()
+            self.power_change(lambda c: c.update(skip_while_charging=on),
+                              "Stays on while charging" if on else "Auto shut-off also while charging")
+
+    # ============================================================ comfort
+    def build_comfort(self):
+        box = self.page("Comfort")
+        dnd = card()
+        self.dnd_switch = Gtk.Switch()
+        self.dnd_switch.connect("notify::active", self.on_bool_setting, "notifications", "DoNotDisturb")
+        dnd.pack_start(switch_row("Do Not Disturb", label("Hide SteamVR notifications. Handy when watching "
+                                                          "or falling asleep.", "desc", wrap=True),
+                                  self.dnd_switch), False, False, 0)
+
+        shots = card()
+        # Switch ON = screenshots blocked (SteamVR's userinterface.screenshots = false).
+        self.shot_switch = Gtk.Switch()
+        self.shot_sub = label("", "desc", wrap=True)
+        self.shot_switch.connect("notify::active", self.on_disable_shots)
+        self.shot_switch.connect("notify::active", lambda *_: self.update_shot_text())
+        shots.pack_start(switch_row("Disable screenshots", self.shot_sub, self.shot_switch), False, False, 0)
+        shots.pack_start(label("How: hold the Steam button and pull a trigger. They appear in Steam → Media.",
+                               "desc", wrap=True), False, False, 0)
+        shots.set_tooltip_markup(SHOT_TOOLTIP)
+
+        screens = card("Screens off when idle", "How long the headset sits idle before the displays "
+                                                "turn off. Default is 5.")
+        self.screens_seg = Segmented([(m, f"{m}") for m in self.SCREEN_CHOICES], self.on_screens_pick)
+        screens.pack_start(self.screens_seg, False, False, 0)
+        screens.pack_start(label("minutes", "desc", xalign=0.5), False, False, 0)
+
+        theater = card("Theater surroundings", "Brightness of the room around the big screen when "
+                                               "watching video. Lower is darker, easier at night. Default 50.")
+        self.theater_adj = Gtk.Adjustment(value=50, lower=0, upper=100, step_increment=5, page_increment=10)
+        theater.pack_start(Stepper(self.theater_adj, 10, {50: "default"}, on_change=self.on_theater),
+                           False, False, 0)
+
+        box.pack_start(self.two_columns(dnd, shots, screens, theater), False, False, 0)
+        self.comfort_result = label("", "status")
+        box.pack_start(self.comfort_result, False, False, 0)
+        box.pack_start(label("These are SteamVR settings and take effect right away.", "desc"), False, False, 0)
+        return box
+
+    def update_shot_text(self):
+        if self.shot_switch.get_active():
+            self.shot_sub.set_text("ON: screenshots are blocked. Steam button + trigger won't take one, "
+                                   "even by accident.")
+        else:
+            self.shot_sub.set_text("OFF (default): screenshots work.")
+
+    def on_disable_shots(self, switch, _pspec):
+        if not self.loading:
+            allow = not switch.get_active()
+            self.comfort_change("Screenshots allowed" if allow else "Screenshots disabled",
+                                "userinterface", "screenshots", "bool", allow)
+
+    def refresh_comfort(self):
+        self.loading = True
+        self.dnd_switch.set_active(vr_get("notifications", "DoNotDisturb", "bool", False))
+        self.shot_switch.set_active(not vr_get("userinterface", "screenshots", "bool", True))
+        self.update_shot_text()
+        self.screens_seg.set_value(int(round(vr_get("power", "turnOffScreensTimeout", "float", 5.0))))
+        self.theater_adj.set_value(round(vr_get("dashboard", "theaterModeBrightness", "float", 0.5) * 100))
+        self.loading = False
+
+    def comfort_change(self, desc, section, key, kind, value):
+        def done(result):
+            ok = result is True
+            set_result(self.comfort_result, f"{desc}: saved" if ok else f"{desc}: SteamVR did not take it", ok)
+            if not ok:
+                self.refresh_comfort()
+        in_background(lambda: vr_set(section, key, kind, value), done)
+
+    def on_bool_setting(self, switch, _pspec, section, key):
+        if not self.loading:
+            on = switch.get_active()
+            self.comfort_change(f"Do Not Disturb {'on' if on else 'off'}", section, key, "bool", on)
+
+    def on_screens_pick(self, m):
+        self.comfort_change(f"Screens off after {m} min", "power", "turnOffScreensTimeout", "float", float(m))
+
+    def on_theater(self):
+        if not self.loading:
+            v = int(self.theater_adj.get_value())
+            self.comfort_change(f"Theater surroundings {v}%", "dashboard", "theaterModeBrightness", "float", v / 100)
+
+    # ============================================================== timer
+    def build_timer(self):
+        box = self.page("Timer")
+        now_card = card()
+        row = Gtk.Box(spacing=30)
+        self.timer_big = label("No timer", "big")
+        row.pack_start(self.timer_big, False, False, 0)
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER)
+        self.timer_status = label("", "status", wrap=True)
+        right.pack_start(self.timer_status, False, False, 0)
+        btns = Gtk.Box(spacing=14)
+        cancel = Gtk.Button(label="Cancel timer")
+        cancel.connect("clicked", self.on_kitchen_cancel)
+        btns.pack_start(cancel, False, False, 0)
+        preview = Gtk.Button(label="Preview popup (10 s)")
+        preview.connect("clicked", lambda *_: self.start_kitchen_timer(10, preview=True))
+        btns.pack_start(preview, False, False, 0)
+        right.pack_start(btns, False, False, 0)
+        row.pack_start(right, True, True, 0)
+        now_card.pack_start(row, False, False, 0)
+        box.pack_start(now_card, False, False, 0)
+
+        start = card("Start a timer", "Tap a time to start. For the last minute a countdown pops up at the "
+                                      "top of your view; at zero it rings. Works with this app closed.")
+        start.pack_start(label("What for?", "status"), False, False, 0)
+        self.timer_label_seg = Segmented([(t, t) for t in self.TIMER_LABELS],
+                                         lambda _v: self.timer_name.set_text(""))
+        self.timer_label_seg.set_value("Timer")
+        start.pack_start(self.timer_label_seg, False, False, 0)
+        self.timer_name = Gtk.Entry(placeholder_text="…or type your own name", max_length=40)
+        self.timer_name.connect("changed", lambda e: self.timer_label_seg.set_value(
+            None if e.get_text().strip() else (self.timer_label_seg.value or "Timer")))
+        start.pack_start(self.timer_name, False, False, 0)
+        start.pack_start(label("How long? (minutes)", "status"), False, False, 0)
+        half = len(self.TIMER_MINUTES) // 2
+        for chunk in (self.TIMER_MINUTES[:half], self.TIMER_MINUTES[half:]):
+            seg = Segmented([(m, str(m)) for m in chunk], lambda m: self.start_kitchen_timer(m * 60))
+            start.pack_start(seg, False, False, 0)
+        custom = Gtk.Box(spacing=14)
+        custom.pack_start(label("Other:", "status"), False, False, 0)
+        self.kitchen_adj = Gtk.Adjustment(value=25, lower=1, upper=180, step_increment=1, page_increment=5)
+        custom.pack_start(Stepper(self.kitchen_adj, 1), True, True, 0)
+        go = add_class(Gtk.Button(label="Start"), "primary")
+        go.connect("clicked", lambda *_: self.start_kitchen_timer(int(self.kitchen_adj.get_value()) * 60))
+        custom.pack_start(go, False, False, 0)
+        start.pack_start(custom, False, False, 0)
+        box.pack_start(start, False, False, 0)
+        self.timer_result = label("", "status", wrap=True)
+        box.pack_start(self.timer_result, False, False, 0)
+        return box
+
+    def render_timer_images(self, text):
+        """Countdown pictures for the headset popup: 00..60.rgba and done.rgba."""
+        out = kitchen_timer.IMG_DIR
+        os.makedirs(out, exist_ok=True)
+        for f in os.listdir(out):
+            if f.endswith((".png", ".rgba")):
+                os.remove(os.path.join(out, f))
+        with HudRenderer() as r:
+            for s in range(61):
+                r.render(text, f"{s // 60}:{s % 60:02d}", os.path.join(out, f"{s:02d}.rgba"))
+            r.render(text, "Time's up!", os.path.join(out, "done.rgba"), done=True)
+
+    def start_kitchen_timer(self, seconds, preview=False):
+        what = self.timer_name.get_text().strip() or self.timer_label_seg.value or "Timer"
+        set_result(self.timer_result, "Getting the popup ready…", True)
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        try:
+            self.render_timer_images(what)
+        except Exception as e:  # noqa: BLE001
+            set_result(self.timer_result, f"Couldn't draw the popup: {e}", False)
+            return
+        ok, msg = kitchen_timer.start(seconds, what)
+        if ok:
+            end = time.strftime("%H:%M", time.localtime(time.time() + seconds))
+            set_result(self.timer_result, "Preview: the popup shows in your view now and rings at zero." if preview
+                       else f"{what} timer set for {seconds // 60} min (rings at {end}).", True)
+        else:
+            set_result(self.timer_result, f"Couldn't start the timer: {msg}", False)
+        self.tick_timer()
+
+    def on_kitchen_cancel(self, *_):
+        kitchen_timer.cancel()
+        set_result(self.timer_result, "Timer cancelled.", True)
+        self.tick_timer()
+
+    def tick_timer(self):
+        if not self.focused or self.stack.get_visible_child_name() != "Timer":
+            return True  # only the Timer page shows the clock
+        st = kitchen_timer.status()
+        if st:
+            left = max(0, int(st["end"] - time.time() + 0.999))
+            self.timer_big.set_text(f"{left // 60}:{left % 60:02d}")
+            when = time.strftime("%H:%M", time.localtime(st["end"]))
+            self.timer_status.set_text(f"{st['label']}: rings at {when}. The countdown pops up in your view "
+                                       f"for the last minute." if left > 0 else f"{st['label']}: time's up!")
+        else:
+            self.timer_big.set_text("No timer")
+            self.timer_status.set_text("Pick a time below to start one.")
+        return True
+
+    # ========================================================== reminders
+    REMINDER_LABELS = ["Reminder", "Food", "Pizza", "Laundry", "Meds", "Call"]
+
+    def build_reminders(self):
+        box = self.page("Reminders")
+        box.pack_start(label("Pops up at the top of your view at that time and rings. Works with this app "
+                             "closed; if the Frame is off then, it shows when it next starts.", "desc", wrap=True),
+                       False, False, 0)
+        when_card = card("When")
+        today = datetime.date.today()
+        names = ["Today", "Tomorrow"] + [(today + datetime.timedelta(days=d)).strftime("%a %d")
+                                         for d in range(2, 7)]
+        self.rem_day_seg = Segmented(list(enumerate(names)), lambda d: self.rem_day.set(d, notify=True),
+                                     per_row=4)
+        when_card.pack_start(self.rem_day_seg, False, False, 0)
+        self.rem_day = Spin(0, 365, 1, 0, wrap=False, width_chars=11,
+                            fmt=lambda d: (datetime.date.today() + datetime.timedelta(days=d)).strftime("%a, %b %d"),
+                            on_change=self.on_rem_day)
+        when_card.pack_start(self.rem_day, False, False, 0)
+
+        start = datetime.datetime.now() + datetime.timedelta(minutes=20)
+        start = start.replace(minute=(start.minute // 5) * 5)
+        trow = Gtk.Box(spacing=12)
+        self.rem_hour = Spin(1, 12, 1, start.hour % 12 or 12, width_chars=2,
+                             on_change=lambda _v: self.update_rem_summary())
+        self.rem_min = Spin(0, 55, 5, start.minute, fmt=lambda m: f"{m:02d}", width_chars=2,
+                            on_change=lambda _v: self.update_rem_summary())
+        trow.pack_start(self.rem_hour, True, True, 0)
+        trow.pack_start(label(":", "spin-value"), False, False, 0)
+        trow.pack_start(self.rem_min, True, True, 0)
+        when_card.pack_start(trow, False, False, 0)
+        self.rem_ampm = Segmented([("AM", "AM"), ("PM", "PM")], lambda _v: self.update_rem_summary())
+        self.rem_ampm.set_value("PM" if start.hour >= 12 else "AM")
+        when_card.pack_start(self.rem_ampm, False, False, 0)
+
+        what = card("What")
+        self.rem_label_seg = Segmented([(t, t) for t in self.REMINDER_LABELS],
+                                       lambda _v: (self.rem_entry.set_text(""), self.update_rem_summary()),
+                                       per_row=3)
+        self.rem_label_seg.set_value("Reminder")
+        what.pack_start(self.rem_label_seg, False, False, 0)
+        self.rem_entry = Gtk.Entry(placeholder_text="…or type your own")
+        self.rem_entry.connect("changed", lambda *_: self.update_rem_summary())
+        what.pack_start(self.rem_entry, False, False, 0)
+        self.rem_summary = label("", "card-title", wrap=True)
+        what.pack_start(self.rem_summary, False, False, 0)
+        set_btn = add_class(Gtk.Button(label="Set reminder"), "primary")
+        set_btn.connect("clicked", self.on_set_reminder)
+        what.pack_start(set_btn, False, False, 0)
+        self.rem_result = label("", "status", wrap=True)
+        what.pack_start(self.rem_result, False, False, 0)
+        what.pack_start(label("Upcoming", "card-title"), False, False, 0)
+        self.rem_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        what.pack_start(self.rem_list, False, False, 0)
+
+        box.pack_start(self.two_columns(when_card, what), False, False, 0)
+        self.rem_day_seg.set_value(0)
+        self.update_rem_summary()
+        return box
+
+    def on_rem_day(self, d):
+        self.rem_day_seg.set_value(d if d < 7 else None)
+        self.update_rem_summary()
+
+    def rem_when(self):
+        h = self.rem_hour.value % 12 + (12 if self.rem_ampm.value == "PM" else 0)
+        day = datetime.date.today() + datetime.timedelta(days=self.rem_day.value)
+        return datetime.datetime.combine(day, datetime.time(h, self.rem_min.value))
+
+    def rem_text(self):
+        return self.rem_entry.get_text().strip() or self.rem_label_seg.value or "Reminder"
+
+    def update_rem_summary(self):
+        when = self.rem_when()
+        delta = when - datetime.datetime.now()
+        if delta.total_seconds() <= 0:
+            rel = "that time has passed"
+        else:
+            mins = int(delta.total_seconds() // 60)
+            rel = (f"in {mins // 1440} d {mins % 1440 // 60} h" if mins >= 1440 else
+                   f"in {mins // 60} h {mins % 60} min" if mins >= 60 else f"in {mins} min")
+        self.rem_summary.set_text(f"{self.rem_text()}: {when.strftime('%a, %b %d at %I:%M %p').replace(' 0', ' ')}"
+                                  f"  ({rel})")
+
+    def on_set_reminder(self, *_):
+        when = self.rem_when()
+        epoch = when.timestamp()
+        text = self.rem_text()
+        if epoch <= time.time():
+            set_result(self.rem_result, "That time has already passed; pick a later one.", False)
+            return
+        rid = reminders.new_id(epoch)
+        try:
+            with HudRenderer() as r:
+                r.render(f"Reminder · {when.strftime('%I:%M %p').lstrip('0')}", text,
+                         reminders.image_path(rid), done=True)
+        except Exception as e:  # noqa: BLE001
+            set_result(self.rem_result, f"Couldn't draw the popup: {e}", False)
+            return
+        ok, msg = reminders.add(rid, epoch, text)
+        set_result(self.rem_result, f"Set: {text}, {when.strftime('%a %b %d, %I:%M %p')}." if ok
+                   else f"Couldn't set it: {msg}", ok)
+        self.refresh_reminders()
+
+    def refresh_reminders(self):
+        for child in self.rem_list.get_children():
+            self.rem_list.remove(child)
+        items = reminders.upcoming()
+        if not items:
+            self.rem_list.pack_start(label("None yet.", "desc"), False, False, 0)
+        for m in items:
+            row = Gtk.Box(spacing=12)
+            when = datetime.datetime.fromtimestamp(m["when"])
+            txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            txt.pack_start(label(m["text"], "status", wrap=True), False, False, 0)
+            txt.pack_start(label(when.strftime("%a, %b %d at %I:%M %p"), "desc"), False, False, 0)
+            row.pack_start(txt, True, True, 0)
+            row.pack_end(ConfirmButton("Delete", "Tap again", lambda rid=m["id"]: self.delete_reminder(rid),
+                                       css="primary"), False, False, 0)
+            self.rem_list.pack_start(row, False, False, 0)
+        self.rem_list.show_all()
+        self.update_rem_summary()
+
+    def delete_reminder(self, rid):
+        reminders.delete(rid)
+        set_result(self.rem_result, "Reminder deleted.", True)
+        self.refresh_reminders()
+
+    # ============================================================== rooms
+    def build_rooms(self):
+        box = self.page("Rooms")
+        box.pack_start(label("Save each room you play in, then load it to get its boundary back without "
+                             "redrawing. Loading restarts SteamVR (about 10 s; open apps close, reopen this one "
+                             "after).", "desc", wrap=True), False, False, 0)
+        tools = Gtk.Box(spacing=14, homogeneous=True)
+        ceil_btn = Gtk.Button(label="Ceiling indicator ›")
+        ceil_btn.connect("clicked", lambda *_: self.show_ceiling_page())
+        tools.pack_start(ceil_btn, True, True, 0)
+        box.pack_start(tools, False, False, 0)
+
+        cur = card("Room in use now")
+        crow = Gtk.Box(spacing=18)
+        self.room_now_img = Gtk.Image()
+        crow.pack_start(self.room_now_img, False, False, 0)
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER)
+        self.room_now_lbl = label("", "status", wrap=True)
+        right.pack_start(self.room_now_lbl, False, False, 0)
+        now_prev = Gtk.Button(label="Preview")
+        now_prev.connect("clicked", lambda *_: self.show_room_preview(rooms.current(), current=True))
+        right.pack_start(now_prev, False, False, 0)
+        self.undo_btn = ConfirmButton("Undo last load", "Tap again to switch back",
+                                      lambda: self.load_room(rooms.BACKUP, "the room before the last load"),
+                                      css="primary")
+        right.pack_start(self.undo_btn, False, False, 0)
+        crow.pack_start(right, True, True, 0)
+        cur.pack_start(crow, False, False, 0)
+
+        save = card("Save this room")
+        self.room_name = Gtk.Entry(placeholder_text="Name it, e.g. Bedroom")
+        self.room_name.connect("changed", lambda *_: self.reset_save_button())
+        save.pack_start(self.room_name, False, False, 0)
+        save.pack_start(Segmented([(n, n) for n in rooms.SUGGESTED_NAMES],
+                                  lambda n: self.room_name.set_text(n), per_row=3), False, False, 0)
+        self.room_save_btn = add_class(Gtk.Button(label="Save"), "primary")
+        self.room_save_btn.connect("clicked", self.on_save_room)
+        save.pack_start(self.room_save_btn, False, False, 0)
+        box.pack_start(self.two_columns(cur, save), False, False, 0)
+
+        self.rooms_result = label("", "status", wrap=True)
+        box.pack_start(self.rooms_result, False, False, 0)
+        box.pack_start(label("Saved rooms", "card-title"), False, False, 0)
+        self.rooms_grid_holder = Gtk.Box()
+        box.pack_start(self.rooms_grid_holder, False, False, 0)
+        self._replace_armed = (None, 0)
+        return box
+
+    @staticmethod
+    def room_preview(m, w=300, h=200, grid=False):
+        """Top-down drawing of a room's boundary (SVG → image): outline, where you stand (dot), which way
+        you face (line). grid=True adds a 1 m grid, for the big preview."""
+        pts = m.get("outline") or []
+        bg = "#141b24"
+        k = min(max(1.0, h / 200), 1.6)  # bigger drawing: somewhat thicker lines and bigger text (capped)
+        if len(pts) < 3:
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">'
+                   f'<rect width="{w}" height="{h}" rx="14" fill="{bg}"/>'
+                   f'<text x="{w / 2}" y="{h / 2}" fill="#9fb3c8" font-size="{20 * k:.0f}" text-anchor="middle" '
+                   f'font-family="sans-serif">No boundary drawn</text></svg>')
+        else:
+            xs, zs = [p[0] for p in pts], [p[1] for p in pts]
+            st = m.get("standing")
+            if st:
+                xs.append(st[0])
+                zs.append(st[1])
+            minx, maxx, minz, maxz = min(xs), max(xs), min(zs), max(zs)
+            pad, foot = 18 * k, 26 * k
+            s = min((w - 2 * pad) / max(maxx - minx, 0.5), (h - 2 * pad - foot) / max(maxz - minz, 0.5))
+            ox = (w - (maxx - minx) * s) / 2
+            oz = (h - foot - (maxz - minz) * s) / 2
+
+            def P(x, z):
+                return ox + (x - minx) * s, oz + (z - minz) * s
+            lines = ""
+            if grid:  # 1 m squares
+                gx = math.floor(minx)
+                while gx <= maxx + 1e-6:
+                    x1, _ = P(gx, minz)
+                    lines += (f'<line x1="{x1:.1f}" y1="{oz:.1f}" x2="{x1:.1f}" '
+                              f'y2="{oz + (maxz - minz) * s:.1f}" stroke="#2c3b4b" stroke-width="1.5"/>')
+                    gx += 1
+                gz = math.floor(minz)
+                while gz <= maxz + 1e-6:
+                    _, z1 = P(minx, gz)
+                    lines += (f'<line x1="{ox:.1f}" y1="{z1:.1f}" x2="{ox + (maxx - minx) * s:.1f}" '
+                              f'y2="{z1:.1f}" stroke="#2c3b4b" stroke-width="1.5"/>')
+                    gz += 1
+            poly = " ".join(f"{px:.1f},{pz:.1f}" for px, pz in (P(x, z) for x, z in pts))
+            extra = ""
+            if st:
+                sx, sz = P(st[0], st[1])
+                fx, fz = -math.sin(st[2]), -math.cos(st[2])  # facing -Z, turned by yaw
+                extra = (f'<line x1="{sx:.1f}" y1="{sz:.1f}" x2="{sx + fx * 26 * k:.1f}" y2="{sz + fz * 26 * k:.1f}" '
+                         f'stroke="#ffffff" stroke-width="{3 * k:.1f}" stroke-linecap="round"/>'
+                         f'<circle cx="{sx:.1f}" cy="{sz:.1f}" r="{6 * k:.1f}" fill="#ffffff"/>')
+            dims = f"about {max(xs[:len(pts)]) - min(xs[:len(pts)]):.1f} × " \
+                   f"{max(zs[:len(pts)]) - min(zs[:len(pts)]):.1f} m · {m.get('area', 0)} m²"
+            if grid:
+                dims += " · grid squares are 1 m"
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">'
+                   f'<rect width="{w}" height="{h}" rx="14" fill="{bg}"/>{lines}'
+                   f'<polygon points="{poly}" fill="{ACCENT}" fill-opacity="0.22" stroke="{ACCENT}" '
+                   f'stroke-width="{3 * k:.1f}" stroke-linejoin="round"/>{extra}'
+                   f'<text x="{w / 2}" y="{h - 8 * k:.0f}" fill="#c9d6e3" font-size="{17 * k:.0f}" '
+                   f'text-anchor="middle" font-family="sans-serif">{dims}</text></svg>')
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.write(svg.encode())
+        loader.close()
+        return loader.get_pixbuf()
+
+    # ============================================================= signal
+    def build_signal(self):
+        box = self.page("Signal")
+        box.pack_start(label(
+            "The Frame has two separate wireless links. Home Wi-Fi is its connection to your router "
+            "(internet, the store, PC streaming without the dongle). The Steam dongle is a private 6 GHz "
+            "link straight from the dongle on your PC (PC VR streaming with the dongle). Map either one.",
+            "desc", wrap=True), False, False, 0)
+        self.sig_now = {}
+        cards_ = []
+        for target, title in wifi_map.TARGETS.items():
+            c = card(title)
+            big = label("", "big", markup=True)
+            c.pack_start(big, False, False, 0)
+            desc = label("", "status", wrap=True)
+            c.pack_start(desc, False, False, 0)
+            self.sig_now[target] = (big, desc)
+            cards_.append(c)
+        room = card("Play-space map", "Walk around your boundary for a minute or two: shows the best spot "
+                                      "to stand for wireless play.")
+        b = add_class(Gtk.Button(label="Open play-space map ›"), "primary")
+        b.connect("clicked", lambda *_: self.show_wifi_page())
+        room.pack_start(b, False, False, 0)
+        house = card("Whole-house map", "Walk every room (several walks add up): a floor plan coloured by "
+                                        "signal, with walls you trace, and a 3D model to export.")
+        b = add_class(Gtk.Button(label="Open whole-house map ›"), "primary")
+        b.connect("clicked", lambda *_: self.show_house_page())
+        house.pack_start(b, False, False, 0)
+        box.pack_start(self.two_columns(*cards_, room, house), False, False, 0)
+        return box
+
+    def refresh_signal(self):
+        readings = {"wifi": wifi_map.signal(), "dongle": wifi_map.dongle_signal()}
+        for target, s in readings.items():
+            big, desc = self.sig_now[target]
+            if s and s.get("dbm") is not None:
+                word, colour = wifi_map.quality(s["dbm"])
+                big.set_markup(f'<span foreground="{colour}">{s["dbm"]:.0f} dBm</span>')
+                where = f"{s['ssid']} ({wifi_map.band(s['freq'])})" if target == "wifi" else "6 GHz, PC dongle"
+                desc.set_text(f"{word.capitalize()} · {s.get('tx') or 0:.0f} Mbit/s · {where}")
+            else:
+                big.set_markup('<span foreground="#8a96a3">Not connected</span>')
+                desc.set_text("The Frame isn't on a Wi-Fi network." if target == "wifi" else
+                              "The PC's dongle isn't linked right now (PC off or asleep, or Steam closed).")
+
+    # ========================================================== wi-fi map
+    WIFI_HUD = os.path.expanduser("~/.cache/frame-settings/wifi-live.rgba")
+    WIFI_HUD_UNIT = "frame-wifi-live"
+    MINIMAP = os.path.expanduser("~/.cache/frame-settings/minimap.rgba")
+    MINIMAP_UNIT = "frame-minimap"
+
+    def build_wifi_page(self):
+        self.wifi_rec = None
+        self.wifi_target = "wifi"
+        box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18), "page")
+        head = Gtk.Box(spacing=18)
+        back = Gtk.Button(label="‹ Back to Signal")
+        back.connect("clicked", lambda *_: self.show_page("Signal"))
+        head.pack_start(back, False, False, 0)
+        head.pack_start(label("Play-space signal map", "page-title"), False, False, 0)
+        box.pack_start(head, False, False, 0)
+        row = Gtk.Box(spacing=26)
+        self.wifi_img = Gtk.Image()
+        row.pack_start(self.wifi_img, False, False, 0)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        side.pack_start(label("Show signal of", "desc"), False, False, 0)
+        self.wifi_target_seg = Segmented(list(wifi_map.TARGETS.items()), self.on_wifi_target)
+        self.wifi_target_seg.set_value("wifi")
+        side.pack_start(self.wifi_target_seg, False, False, 0)
+        self.wifi_now = label("", "big", markup=True)
+        side.pack_start(self.wifi_now, False, False, 0)
+        self.wifi_now_desc = label("", "status", wrap=True)
+        side.pack_start(self.wifi_now_desc, False, False, 0)
+        acts = Gtk.Box(spacing=10, homogeneous=True)
+        self.wifi_btn = add_class(Gtk.Button(label="Start mapping"), "primary")
+        self.wifi_btn.connect("clicked", self.on_wifi_button)
+        acts.pack_start(self.wifi_btn, True, True, 0)
+        acts.pack_start(ConfirmButton("Clear map", "Tap again to clear", self.on_wifi_clear), True, True, 0)
+        side.pack_start(acts, False, False, 0)
+        self.wifi_progress = label("", "status", wrap=True)
+        side.pack_start(self.wifi_progress, False, False, 0)
+        self.wifi_result = label("", "status", wrap=True)
+        side.pack_start(self.wifi_result, False, False, 0)
+        side.pack_start(label("Walk slowly around your play space at the height you play, for a minute or two. "
+                              "Both links are measured at once; a readout floats in your view; it stops by "
+                              "itself after 5 minutes. For streaming VR, aim for -60 dBm or better.",
+                              "desc", wrap=True), False, False, 0)
+        row.pack_start(side, True, True, 0)
+        box.pack_start(row, False, False, 0)
+        return box
+
+    def show_wifi_page(self):
+        self.show_page("WifiMap")
+
+    def on_wifi_target(self, target):
+        self.wifi_target = target
+        self.refresh_wifi(full=True)
+
+    def refresh_wifi(self, full=False):
+        rec = self.wifi_rec
+        live = rec and rec.running
+        if self.wifi_target == "wifi":
+            s = rec.latest if live else wifi_map.signal()
+        else:
+            s = rec.latest_dongle if live else wifi_map.dongle_signal()
+        if s and s.get("dbm") is not None:
+            word, colour = wifi_map.quality(s["dbm"])
+            self.wifi_now.set_markup(f'<span foreground="{colour}">{s["dbm"]:.0f} dBm</span>')
+            where = (f"{s['ssid']} ({wifi_map.band(s['freq'])})" if self.wifi_target == "wifi"
+                     else "PC dongle, 6 GHz")
+            self.wifi_now_desc.set_text(f"{word.capitalize()} · {s.get('tx') or 0:.0f} Mbit/s · {where}")
+        elif self.wifi_target == "wifi":
+            self.wifi_now.set_markup('<span foreground="#8a96a3">No Wi-Fi</span>')
+            self.wifi_now_desc.set_text("The Frame isn't connected to a Wi-Fi network.")
+        else:
+            self.wifi_now.set_markup('<span foreground="#8a96a3">No dongle</span>')
+            self.wifi_now_desc.set_text("The PC's dongle isn't linked right now (PC off or asleep, or Steam closed).")
+        if live:
+            m = {"bounds": rec.bounds, "samples": list(rec.samples)}
+            el = int(rec.elapsed())
+            self.wifi_progress.set_text(f"Mapping: {el // 60}:{el % 60:02d} · {len(rec.samples)} readings"
+                                        + ("" if rec.pose else " · headset not tracking: put it on"))
+            self.wifi_img.set_from_pixbuf(self.wifi_svg(m, self.wifi_target))
+            return
+        if full:
+            m = wifi_map.last_map()
+            self.wifi_img.set_from_pixbuf(self.wifi_svg(m or {}, self.wifi_target))
+            self.show_wifi_result(m)
+
+    def show_wifi_result(self, m):
+        if not m:
+            self.wifi_result.set_text("")
+            return
+        r = (m.get("links") or {}).get(self.wifi_target) or (m if self.wifi_target == "wifi" else {})
+        if not r.get("best"):
+            self.wifi_result.set_text(f"No {wifi_map.TARGETS[self.wifi_target]} readings in this map." +
+                                      (" Map again with the PC's dongle on." if self.wifi_target == "dongle"
+                                       else ""))
+            return
+        b, w = r["best"], r["worst"]
+        when = time.strftime("%b %d, %I:%M %p", time.localtime(m.get("saved", 0)))
+        self.wifi_result.set_text(
+            f"Map from {when}:\n"
+            f"Best spot: {b['dbm']:.0f} dBm ({wifi_map.quality(b['dbm'])[0]}), {b['tx']} Mbit/s, "
+            f"{wifi_map.where(b['at'])}\n"
+            f"Weakest: {w['dbm']:.0f} dBm, {wifi_map.where(w['at'])}\nAverage: {r['avg']:.0f} dBm")
+
+    def on_wifi_button(self, *_):
+        if self.wifi_rec and self.wifi_rec.running:
+            self.stop_wifi_mapping()
+            return
+        rec = wifi_map.Recorder()
+        try:
+            rec.start()
+        except Exception as e:  # noqa: BLE001
+            set_result(self.wifi_progress, f"Couldn't start: {e}", False)
+            return
+        self.wifi_rec = rec
+        self.wifi_btn.set_label("Stop mapping")
+        self.wifi_result.set_text("")
+        self.render_wifi_hud()
+        subprocess.run(["systemctl", "--user", "stop", self.WIFI_HUD_UNIT], capture_output=True)
+        subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.WIFI_HUD_UNIT}",
+                        kitchen_timer.BIN, "--live", self.WIFI_HUD], capture_output=True)
+        GLib.timeout_add(1000, self.tick_wifi)
+
+    def on_wifi_clear(self):
+        if self.wifi_rec and self.wifi_rec.running:
+            self.stop_wifi_mapping()
+        wifi_map.clear()
+        self.wifi_progress.set_text("Cleared. Press Start mapping to map from scratch.")
+        self.wifi_img.set_from_pixbuf(self.wifi_svg({}, self.wifi_target))
+        self.show_wifi_result(None)
+
+    def tick_wifi(self):
+        rec = self.wifi_rec
+        if not rec:
+            return False
+        if not rec.running:  # stopped by itself (5 min)
+            self.stop_wifi_mapping()
+            return False
+        self.render_wifi_hud()
+        if self.stack.get_visible_child_name() == "WifiMap":
+            self.refresh_wifi()
+        return True
+
+    def render_wifi_hud(self):
+        rec = self.wifi_rec
+        dongle = self.wifi_target == "dongle"
+        s = (rec.latest_dongle if dongle else rec.latest) if rec else None
+        other = (rec.latest if dongle else rec.latest_dongle) if rec else None
+        name = "Dongle" if dongle else "Wi-Fi"
+        other_txt = (f"{'Wi-Fi' if dongle else 'Dongle'} {other['dbm']:.0f}"
+                     if other and other.get("dbm") is not None else "")
+        if s and s.get("dbm") is not None:
+            word = wifi_map.quality(s["dbm"])[0]
+            title = f"{name} {word} · {s.get('tx') or 0:.0f} Mbit/s" + (f" · {other_txt}" if other_txt else "")
+            big = f"{s['dbm']:.0f} dBm"
+        else:
+            title, big = f"{name} map" + (f" · {other_txt}" if other_txt else ""), "…"
+        os.makedirs(os.path.dirname(self.WIFI_HUD), exist_ok=True)
+        try:
+            with HudRenderer() as r:
+                r.render(title, big, self.WIFI_HUD)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def stop_wifi_mapping(self):
+        rec, self.wifi_rec = self.wifi_rec, None
+        subprocess.run(["systemctl", "--user", "stop", self.WIFI_HUD_UNIT], capture_output=True)
+        self.wifi_btn.set_label("Start mapping")
+        if not rec:
+            return
+        m = rec.stop()
+        n = len(m.get("samples", []))
+        self.wifi_progress.set_text(f"Done: {n} readings in {m.get('cells', 0)} spots." if n else
+                                    "No readings: the headset wasn't tracking. Wear it while you walk.")
+        self.wifi_img.set_from_pixbuf(self.wifi_svg(m, self.wifi_target))
+        self.show_wifi_result(m)
+
+    @staticmethod
+    def wifi_svg(m, target="wifi", w=880, h=700):
+        """Heatmap of one link's strength over the boundary: 0.5 m squares, green strong → red weak."""
+        bounds = m.get("bounds") or []
+        cells = wifi_map.grid(m.get("samples") or [], target)
+        bg = "#141b24"
+        xs = [p[0] for p in bounds] + [(i + d) * wifi_map.CELL for (i, _j) in cells for d in (0, 1)] + [0]
+        zs = [p[1] for p in bounds] + [(j + d) * wifi_map.CELL for (_i, j) in cells for d in (0, 1)] + [0]
+        if len(xs) < 2 or (max(xs) - min(xs) < 0.1 and max(zs) - min(zs) < 0.1):
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">'
+                   f'<rect width="{w}" height="{h}" rx="14" fill="{bg}"/>'
+                   f'<text x="{w / 2}" y="{h / 2}" fill="#9fb3c8" font-size="28" text-anchor="middle" '
+                   f'font-family="sans-serif">No map yet: press Start mapping and walk around</text></svg>')
+        else:
+            minx, maxx, minz, maxz = min(xs), max(xs), min(zs), max(zs)
+            pad, foot = 28, 46
+            s = min((w - 2 * pad) / max(maxx - minx, 0.5), (h - 2 * pad - foot) / max(maxz - minz, 0.5))
+            ox = (w - (maxx - minx) * s) / 2
+            oz = (h - foot - (maxz - minz) * s) / 2
+
+            def P(x, z):
+                return ox + (x - minx) * s, oz + (z - minz) * s
+            parts = [f'<rect width="{w}" height="{h}" rx="14" fill="{bg}"/>']
+            for (i, j), (dbm, _tx, _n) in cells.items():
+                x0, z0 = P(i * wifi_map.CELL, j * wifi_map.CELL)
+                colour = wifi_map.quality(dbm)[1]
+                parts.append(f'<rect x="{x0:.1f}" y="{z0:.1f}" width="{wifi_map.CELL * s:.1f}" '
+                             f'height="{wifi_map.CELL * s:.1f}" fill="{colour}" fill-opacity="0.75"/>')
+            if len(bounds) >= 3:
+                poly = " ".join(f"{px:.1f},{pz:.1f}" for px, pz in (P(x, z) for x, z in bounds))
+                parts.append(f'<polygon points="{poly}" fill="none" stroke="{ACCENT}" stroke-width="4" '
+                             f'stroke-linejoin="round"/>')
+            sx, sz = P(0, 0)  # where the room starts, facing forward (-z)
+            parts.append(f'<line x1="{sx:.1f}" y1="{sz:.1f}" x2="{sx:.1f}" y2="{sz - 34:.1f}" stroke="#ffffff" '
+                         f'stroke-width="5" stroke-linecap="round"/><circle cx="{sx:.1f}" cy="{sz:.1f}" r="9" '
+                         f'fill="#ffffff"/>')
+            summ = wifi_map.summarise_one(m, target)
+            if summ.get("best"):
+                bx, bz = P(*summ["best"]["at"])
+                parts.append(f'<circle cx="{bx:.1f}" cy="{bz:.1f}" r="{max(14, wifi_map.CELL * s * 0.45):.1f}" '
+                             f'fill="none" stroke="#ffffff" stroke-width="5"/>'
+                             f'<text x="{bx:.1f}" y="{bz - wifi_map.CELL * s * 0.6 - 6:.1f}" fill="#ffffff" '
+                             f'font-size="24" font-weight="bold" text-anchor="middle" font-family="sans-serif">'
+                             f'Best</text>')
+            legend = (f"{wifi_map.TARGETS[target]}: green excellent · lime good · yellow fair · orange weak · "
+                      "red poor · dot = room start")
+            parts.append(f'<text x="{w / 2}" y="{h - 14}" fill="#c9d6e3" font-size="17" text-anchor="middle" '
+                         f'font-family="sans-serif">{legend}</text>')
+            svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">{"".join(parts)}</svg>'
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.write(svg.encode())
+        loader.close()
+        return loader.get_pixbuf()
+
+    # ==================================================== whole-house map
+    def build_house_page(self):
+        self.house_rec = None
+        self.house_m = house_map.load()
+        self.house_floor = 0
+        self.house_target = "wifi"
+        self._house_xf = None
+        box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16), "page")
+        head = Gtk.Box(spacing=18)
+        back = Gtk.Button(label="‹ Back to Signal")
+        back.connect("clicked", lambda *_: self.show_page("Signal"))
+        head.pack_start(back, False, False, 0)
+        head.pack_start(label("Whole-house map", "page-title"), False, False, 0)
+        box.pack_start(head, False, False, 0)
+        row = Gtk.Box(spacing=24)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.house_floor_box = Gtk.Box()
+        left.pack_start(self.house_floor_box, False, False, 0)
+        ev = Gtk.EventBox()
+        self.house_img = Gtk.Image()
+        ev.add(self.house_img)
+        ev.connect("button-press-event", self.on_house_click)
+        left.pack_start(ev, False, False, 0)
+        row.pack_start(left, False, False, 0)
+
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        side.pack_start(label("Show signal of", "desc"), False, False, 0)
+        self.house_target_seg = Segmented(list(house_map.TARGETS.items()), self.on_house_target)
+        self.house_target_seg.set_value("wifi")
+        side.pack_start(self.house_target_seg, False, False, 0)
+        self.house_now = label("", "big", markup=True)
+        side.pack_start(self.house_now, False, False, 0)
+        self.house_now_desc = label("", "status", wrap=True, markup=True)
+        side.pack_start(self.house_now_desc, False, False, 0)
+        acts = Gtk.Box(spacing=10, homogeneous=True)
+        self.house_btn = add_class(Gtk.Button(label="Start walking"), "primary")
+        self.house_btn.connect("clicked", self.on_house_button)
+        acts.pack_start(self.house_btn, True, True, 0)
+        acts.pack_start(ConfirmButton("Clear map", "Tap again to clear", self.on_house_clear), True, True, 0)
+        side.pack_start(acts, False, False, 0)
+        self.house_prefs = house_map.prefs()
+        self.wall_switch = Gtk.Switch(active=self.house_prefs["walls"])
+        self.wall_switch.connect("notify::active", self.on_house_pref, "walls")
+        side.pack_start(switch_row("Wall detection", label("Hold a controller out against a wall as you walk "
+                                                           "along it to draw that wall.", "desc", wrap=True),
+                                   self.wall_switch), False, False, 0)
+        self.minimap_switch = Gtk.Switch(active=self.house_prefs["minimap"])
+        self.minimap_switch.connect("notify::active", self.on_house_pref, "minimap")
+        side.pack_start(switch_row("Mini-map in view", label("Low on the left while you walk, like in a game; "
+                                                             "turns with you.", "desc", wrap=True),
+                                   self.minimap_switch), False, False, 0)
+        self.house_progress = label(
+            "Walk every room with the headset on (passthrough helps). Wi-Fi and the Steam dongle are "
+            "both measured. Walks add up; Clear map starts fresh.", "desc", wrap=True)
+        side.pack_start(self.house_progress, False, False, 0)
+        self.house_result = label("", "status", wrap=True)
+        side.pack_start(self.house_result, False, False, 0)
+        side.pack_start(label("Label the map: pick a name, then tap the map where it is.", "desc", wrap=True),
+                        False, False, 0)
+        self.house_label = Segmented([(n, n) for n in house_map.LABELS], lambda _v: None, per_row=3)
+        self.house_label.set_value("Router")
+        side.pack_start(self.house_label, False, False, 0)
+        acts2 = Gtk.Box(spacing=10, homogeneous=True)
+        undo = Gtk.Button(label="Undo label")
+        undo.connect("clicked", self.on_house_undo_label)
+        acts2.pack_start(undo, True, True, 0)
+        export = add_class(Gtk.Button(label="Export 3D model"), "primary")
+        export.connect("clicked", self.on_house_export)
+        acts2.pack_start(export, True, True, 0)
+        side.pack_start(acts2, False, False, 0)
+        self.house_export_lbl = label("", "desc", wrap=True, selectable=True)
+        side.pack_start(self.house_export_lbl, False, False, 0)
+        row.pack_start(side, True, True, 0)
+        box.pack_start(row, False, False, 0)
+        return box
+
+    def show_house_page(self):
+        self.show_page("House")
+
+    def on_house_target(self, target):
+        self.house_target = target
+        self.refresh_house(full=True)
+
+    def house_live(self):
+        """(home Wi-Fi reading, dongle reading): the recorder's latest while walking, else read now."""
+        rec = self.house_rec
+        if rec and rec.running:
+            return rec.latest, rec.latest_dongle
+        return wifi_map.signal(), house_map.dongle_signal()
+
+    def refresh_house(self, full=False):
+        rec = self.house_rec
+        wifi, dongle = self.house_live()
+        sel = wifi if self.house_target == "wifi" else dongle
+        if sel and sel.get("dbm") is not None:
+            self.house_now.set_markup(f'<span foreground="{wifi_map.quality(sel["dbm"])[1]}">'
+                                      f'{sel["dbm"]:.0f} dBm</span>')
+        else:
+            self.house_now.set_markup('<span foreground="#8a96a3">'
+                                      f'{"No Wi-Fi" if self.house_target == "wifi" else "No dongle"}</span>')
+
+        def line(name, s, missing):
+            if not s or s.get("dbm") is None:
+                return f"{name}: {missing}"
+            word, colour = wifi_map.quality(s["dbm"])
+            return (f'{name}: <span foreground="{colour}">{s["dbm"]:.0f} dBm</span> {word}, '
+                    f'{s.get("tx") or 0:.0f} Mbit/s')
+        self.house_now_desc.set_markup(
+            line("Home Wi-Fi", wifi, "not connected") + "\n" +
+            line("Steam dongle", dongle, "not connected (PC dongle off or asleep)"))
+        if rec and rec.running:
+            el = int(rec.elapsed())
+            self.house_progress.set_text(f"Walking: {el // 60}:{el % 60:02d} · {rec.distance:.0f} m · "
+                                         f"{len(rec.samples)} readings · {len(rec.walls)} wall points" +
+                                         ("" if rec.pose else " · headset not tracking: put it on"))
+            self.draw_house(house_map.add_walk(self.copy_house(), rec))
+            return
+        if full:
+            self.draw_house(self.house_m or {})
+            self.show_house_result()
+
+    def copy_house(self):
+        m = self.house_m
+        if not m:
+            return None
+        return dict(m, samples=list(m.get("samples", [])), walls=list(m.get("walls", [])))
+
+    def draw_house(self, m):
+        samples = m.get("samples") or []
+        fl = house_map.floors(samples) if samples else [0]
+        if self.house_floor not in fl:
+            self.house_floor = fl[0]
+        for child in self.house_floor_box.get_children():
+            self.house_floor_box.remove(child)
+        if len(fl) > 1:
+            seg = Segmented([(f, house_map.floor_name(f)) for f in fl],
+                            lambda f: (setattr(self, "house_floor", f), self.draw_house(m)))
+            seg.set_value(self.house_floor)
+            self.house_floor_box.pack_start(seg, True, True, 0)
+            self.house_floor_box.show_all()
+        pix, self._house_xf = self.house_svg(m, self.house_floor, self.house_target)
+        self.house_img.set_from_pixbuf(pix)
+
+    @staticmethod
+    def house_svg(m, floor, target="wifi", w=820, h=740):
+        """Top-down map of one floor: 0.5 m squares by the chosen signal, traced walls (solid), the edge
+        of the walked area (dashed), the path, labels, a 1 m scale. Returns (pixbuf, transform), the
+        transform mapping image pixels back to metres for labelling."""
+        samples = m.get("samples") or []
+        base = house_map.floor_base(samples) if samples else 0
+        on_floor = [s for s in samples if house_map.floor_of(s[1], base) == floor]
+        walked = {(i, j) for f, i, j in house_map.footprint(samples) if f == floor} if samples else set()
+        cs = {(i, j): v for (f, i, j), v in house_map.cells(samples, target).items() if f == floor} if samples else {}
+        walls = house_map.wall_lines(m, floor) if samples else []
+        labels = [l for l in m.get("labels", []) if l.get("floor", 0) == floor]
+        bg = "#141b24"
+        xs = ([(i + d) * house_map.CELL for (i, _j) in walked for d in (0, 1)] + [l["x"] for l in labels]
+              + [x for ln in walls for x, _z in ln] + [0])
+        zs = ([(j + d) * house_map.CELL for (_i, j) in walked for d in (0, 1)] + [l["z"] for l in labels]
+              + [z for ln in walls for _x, z in ln] + [0])
+        xf = None
+        if not walked:
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">'
+                   f'<rect width="{w}" height="{h}" rx="14" fill="{bg}"/>'
+                   f'<text x="{w / 2}" y="{h / 2}" fill="#9fb3c8" font-size="28" text-anchor="middle" '
+                   f'font-family="sans-serif">No house map yet: press Start walking</text></svg>')
+        else:
+            minx, maxx, minz, maxz = min(xs) - 0.5, max(xs) + 0.5, min(zs) - 0.5, max(zs) + 0.5
+            pad, foot = 20, 40
+            s = min((w - 2 * pad) / (maxx - minx), (h - 2 * pad - foot) / (maxz - minz))
+            ox = (w - (maxx - minx) * s) / 2
+            oz = (h - foot - (maxz - minz) * s) / 2
+            xf = (minx, minz, s, ox, oz)
+
+            def P(x, z):
+                return ox + (x - minx) * s, oz + (z - minz) * s
+            cw = house_map.CELL * s + 0.5
+            parts = [f'<rect width="{w}" height="{h}" rx="14" fill="{bg}"/>']
+            for (i, j) in walked:  # floor where you walked (grey where this signal wasn't measured)
+                if (i, j) not in cs:
+                    x0, z0 = P(i * house_map.CELL, j * house_map.CELL)
+                    parts.append(f'<rect x="{x0:.1f}" y="{z0:.1f}" width="{cw:.1f}" height="{cw:.1f}" '
+                                 f'fill="#3a4654"/>')
+            for (i, j), (dbm, _tx, _n) in cs.items():
+                x0, z0 = P(i * house_map.CELL, j * house_map.CELL)
+                parts.append(f'<rect x="{x0:.1f}" y="{z0:.1f}" width="{cw:.1f}" height="{cw:.1f}" '
+                             f'fill="{wifi_map.quality(dbm)[1]}" fill-opacity="0.8"/>')
+            for xa, za, xb, zb in house_map.outline_edges(samples, floor):  # edge of the walked area
+                (ax, az), (bx, bz) = P(xa, za), P(xb, zb)
+                parts.append(f'<line x1="{ax:.1f}" y1="{az:.1f}" x2="{bx:.1f}" y2="{bz:.1f}" stroke="#66ccff" '
+                             f'stroke-opacity="0.45" stroke-width="2" stroke-dasharray="6 5"/>')
+            seg, pts = None, []
+            for smp in on_floor + [[0, 0, 0, None, None, -1]]:  # path, one polyline per segment
+                x, z, sg = smp[0], smp[2], smp[5]
+                if sg != seg and len(pts) > 1:
+                    parts.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#ffffff" '
+                                 f'stroke-opacity="0.5" stroke-width="2"/>')
+                if sg != seg:
+                    pts, seg = [], sg
+                px, pz = P(x, z)
+                pts.append(f"{px:.1f},{pz:.1f}")
+            for ln in walls:  # traced walls
+                pts = " ".join("%.1f,%.1f" % P(x, z) for x, z in ln)
+                parts.append(f'<polyline points="{pts}" fill="none" stroke="#eef4fa" stroke-width="7" '
+                             f'stroke-linecap="round" stroke-linejoin="round"/>')
+            if floor == 0:
+                sx, sz = P(0, 0)
+                parts.append(f'<circle cx="{sx:.1f}" cy="{sz:.1f}" r="8" fill="#ffffff"/>')
+            for l in labels:
+                lx, lz = P(l["x"], l["z"])
+                parts.append(f'<circle cx="{lx:.1f}" cy="{lz:.1f}" r="9" fill="{ACCENT}" stroke="#0e141b" '
+                             f'stroke-width="3"/><text x="{lx:.1f}" y="{lz - 14:.1f}" fill="#ffffff" '
+                             f'font-size="22" font-weight="bold" text-anchor="middle" font-family="sans-serif" '
+                             f'stroke="#0e141b" stroke-width="5" paint-order="stroke">{l["name"]}</text>')
+            bar = s  # 1 m scale bar
+            parts.append(f'<line x1="{pad}" y1="{h - 18}" x2="{pad + bar:.1f}" y2="{h - 18}" stroke="#c9d6e3" '
+                         f'stroke-width="4"/><text x="{pad + bar + 10:.1f}" y="{h - 11}" fill="#c9d6e3" '
+                         f'font-size="19" font-family="sans-serif">1 m · {house_map.TARGETS[target]}: green strong '
+                         f'→ red weak · white lines = walls · dot = start</text>')
+            svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">{"".join(parts)}</svg>'
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.write(svg.encode())
+        loader.close()
+        return loader.get_pixbuf(), xf
+
+    def show_house_result(self):
+        m = self.house_m
+        if not m:
+            self.house_result.set_text("")
+            return
+        sm = house_map.summary(m, self.house_target)
+        when = time.strftime("%b %d, %I:%M %p", time.localtime(m.get("saved", 0)))
+        walks = m.get("walks", 1)
+        head = (f"{walks} walk{'s' if walks != 1 else ''}, last {when}: {m.get('distance', 0):.0f} m, "
+                f"{len(house_map.wall_lines(m, self.house_floor))} wall lines on this floor\n")
+        if not sm:
+            name = house_map.TARGETS[self.house_target]
+            self.house_result.set_text(head + f"No {name} readings in this map" +
+                                       (": the dongle was off or asleep while walking." if
+                                        self.house_target == "dongle" else "."))
+            return
+        self.house_result.set_text(
+            head + f"Best: {sm['best']}\nWeakest: {sm['worst']}\nAverage {sm['avg']:.0f} dBm · "
+            f"{sm['weak_share'] * 100:.0f}% of the walked area is weak or poor")
+
+    def on_house_button(self, *_):
+        if self.house_rec and self.house_rec.running:
+            self.stop_house_walk()
+            return
+        if self.wifi_rec and self.wifi_rec.running:
+            set_result(self.house_progress, "Stop the room Wi-Fi map first.", False)
+            return
+        rec = house_map.HouseRecorder()
+        segs = [s[5] for s in (self.house_m or {}).get("samples", [])]
+        try:
+            rec.start(segment_offset=max(segs) + 1 if segs else 0)
+        except Exception as e:  # noqa: BLE001
+            set_result(self.house_progress, f"Couldn't start: {e}", False)
+            return
+        rec.trace_walls = self.house_prefs["walls"]
+        self.house_rec = rec
+        self.house_btn.set_label("Stop walking")
+        self.house_result.set_text("")
+        self.render_house_hud()
+        self.set_minimap(self.house_prefs["minimap"])
+        subprocess.run(["systemctl", "--user", "stop", self.WIFI_HUD_UNIT], capture_output=True)
+        subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.WIFI_HUD_UNIT}",
+                        kitchen_timer.BIN, "--live", self.WIFI_HUD], capture_output=True)
+        GLib.timeout_add(1000, self.tick_house)
+
+    def tick_house(self):
+        rec = self.house_rec
+        if not rec:
+            return False
+        if not rec.running:
+            self.stop_house_walk()
+            return False
+        self.render_house_hud()
+        if self.house_prefs["minimap"]:
+            self.render_minimap()
+        if self.stack.get_visible_child_name() == "House" and int(rec.elapsed()) % 3 == 0:
+            self.refresh_house()  # redrawing the map every 3 s is plenty
+        return True
+
+    def render_house_hud(self):
+        """Floating readout while walking: the chosen signal big, the other one and wall points small."""
+        rec = self.house_rec
+        el = int(rec.elapsed()) if rec else 0
+        wifi, dongle = (rec.latest, rec.latest_dongle) if rec else (None, None)
+
+        def short(s):
+            return f"{s['dbm']:.0f}" if s and s.get("dbm") is not None else "--"
+        if self.house_target == "wifi":
+            sel, other = wifi, f"Dongle {short(dongle)}"
+        else:
+            sel, other = dongle, f"Wi-Fi {short(wifi)}"
+        title = (f"{house_map.TARGETS[self.house_target]} · {other} · {el // 60}:{el % 60:02d} · "
+                 + ("Wall ✓" if rec and rec.on_wall() else f"walls {len(rec.walls) if rec else 0}"))
+        big = f"{sel['dbm']:.0f} dBm" if sel and sel.get("dbm") is not None else "…"
+        os.makedirs(os.path.dirname(self.WIFI_HUD), exist_ok=True)
+        try:
+            with HudRenderer() as r:
+                r.render(title, big, self.WIFI_HUD)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def stop_house_walk(self):
+        rec, self.house_rec = self.house_rec, None
+        subprocess.run(["systemctl", "--user", "stop", self.WIFI_HUD_UNIT, self.MINIMAP_UNIT], capture_output=True)
+        self.house_btn.set_label("Start walking")
+        if not rec:
+            return
+        rec.stop()
+        if rec.samples:
+            self.house_m = house_map.add_walk(self.house_m, rec)
+            house_map.save(self.house_m)
+            dongle = sum(1 for s in rec.samples if s[house_map.DONGLE] is not None)
+            self.house_progress.set_text(
+                f"Added: {rec.distance:.0f} m walked, {len(rec.samples)} readings, {len(rec.walls)} wall points"
+                + ("" if dongle else ", no dongle readings (PC dongle off?)")
+                + ". Walk more to add rooms, then label the map and export the 3D model.")
+        else:
+            self.house_progress.set_text("No readings: the headset wasn't tracking. Wear it while you walk.")
+        self.draw_house(self.house_m or {})
+        self.show_house_result()
+
+    def on_house_pref(self, switch, _pspec, key):
+        self.house_prefs[key] = switch.get_active()
+        house_map.save_prefs(self.house_prefs)
+        rec = self.house_rec
+        if rec and rec.running:
+            if key == "walls":
+                rec.trace_walls = switch.get_active()
+            else:
+                self.set_minimap(switch.get_active())
+
+    def set_minimap(self, on):
+        """Shows (renders + starts the overlay) or hides the mini-map in view."""
+        subprocess.run(["systemctl", "--user", "stop", self.MINIMAP_UNIT], capture_output=True)
+        if on:
+            self.render_minimap()
+            subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.MINIMAP_UNIT}",
+                            kitchen_timer.BIN, "--minimap", self.MINIMAP], capture_output=True)
+
+    def render_minimap(self):
+        rec = self.house_rec
+        if not rec:
+            return
+        pose = rec.pose or rec._last or (0.0, house_map.EYE_HEIGHT, 0.0)
+        sig = rec.latest_dongle if self.house_target == "dongle" else rec.latest
+        name = "Dongle" if self.house_target == "dongle" else "Wi-Fi"
+        caption = (f"{name} {sig['dbm']:.0f} dBm" if sig and sig.get("dbm") is not None else f"{name}: none")
+        if not rec.pose:
+            caption = "Not tracking"
+        m = house_map.add_walk(self.copy_house(), rec)
+        try:
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.write(house_map.minimap_svg(m, pose, rec.heading, self.house_target, caption,
+                                               hands=dict(rec.hands), on_wall=rec.on_wall()).encode())
+            loader.close()
+            write_rgba(loader.get_pixbuf(), self.MINIMAP)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_house_clear(self):
+        if self.house_rec and self.house_rec.running:
+            self.stop_house_walk()
+        house_map.clear()
+        self.house_m = None
+        self.house_floor = 0
+        self.house_progress.set_text("Cleared. Press Start walking to map the house from scratch.")
+        self.house_export_lbl.set_text("")
+        self.draw_house({})
+        self.show_house_result()
+
+    def on_house_click(self, ev_box, event):
+        m = self.house_m
+        if not m or not self._house_xf or (self.house_rec and self.house_rec.running):
+            return False
+        pix = self.house_img.get_pixbuf()
+        alloc = self.house_img.get_allocation()
+        px = event.x - (alloc.width - pix.get_width()) / 2
+        py = event.y - (alloc.height - pix.get_height()) / 2
+        minx, minz, s, ox, oz = self._house_xf
+        x, z = (px - ox) / s + minx, (py - oz) / s + minz
+        m.setdefault("labels", []).append({"name": self.house_label.value or "Spot", "x": round(x, 2),
+                                           "z": round(z, 2), "floor": self.house_floor})
+        house_map.save(m)
+        self.draw_house(m)
+        self.show_house_result()
+        return True
+
+    def on_house_undo_label(self, *_):
+        m = self.house_m
+        if m and m.get("labels"):
+            m["labels"].pop()
+            house_map.save(m)
+            self.draw_house(m)
+            self.show_house_result()
+
+    def on_house_export(self, *_):
+        if not self.house_m:
+            self.house_export_lbl.set_text("Walk the house first.")
+            return
+        try:
+            path, verts, tris = house_map.export_glb(self.house_m, self.house_target)
+        except Exception as e:  # noqa: BLE001
+            self.house_export_lbl.set_text(f"Couldn't export: {e}")
+            return
+        self.house_export_lbl.set_text(f"Saved {path}\n({tris:,} triangles, {house_map.TARGETS[self.house_target]}"
+                                       "). Open it in Blender or Windows 3D Viewer.")
+
+    # =========================================================== ceiling
+    def build_ceiling_page(self):
+        c = ceiling.load()
+        box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18), "page")
+        head = Gtk.Box(spacing=18)
+        back = Gtk.Button(label="‹ Back to rooms")
+        back.connect("clicked", lambda *_: self.show_page("Rooms"))
+        head.pack_start(back, False, False, 0)
+        head.pack_start(label("Ceiling indicator", "page-title"), False, False, 0)
+        box.pack_start(head, False, False, 0)
+
+        show = card("Show")
+        self.ceil_switches = {}
+        rows = (("enabled", "Ceiling indicator", "Turns the whole thing on or off."),
+                ("near", "Grid near hands or head", "A grid at your ceiling fades in when a controller or your "
+                 "head gets within 40 cm of it."),
+                ("always", "Always-on faint grid", "The same grid stays faintly visible all the time."),
+                ("upmarker", "Real up marker", "While Recline tilts the world, markers point to your real "
+                 "ceiling and floor."))
+        for key, title, desc in rows:
+            sw = Gtk.Switch()
+            sw.set_active(bool(c.get(key)))
+            sw.connect("notify::active", self.on_ceiling_switch, key)
+            show.pack_start(switch_row(title, label(desc, "desc", wrap=True), sw), False, False, 0)
+            self.ceil_switches[key] = sw
+
+        hgt = card("Ceiling height", "Measure it once: hold a controller flat against the ceiling over your "
+                                     "play area while the countdown runs (sitting or standing, not reclined).")
+        self.ceil_height = Spin(150, 400, 1, int(round(c["height"] * 100)), width_chars=6,
+                                fmt=lambda v: f"{v / 100:.2f} m", wrap=False,
+                                on_change=lambda v: self.on_ceiling_height(v))
+        hgt.pack_start(self.ceil_height, False, False, 0)
+        self.ceil_measure_btn = add_class(Gtk.Button(label="Measure with a controller (5 s)"), "primary")
+        self.ceil_measure_btn.connect("clicked", self.on_ceiling_measure)
+        hgt.pack_start(self.ceil_measure_btn, False, False, 0)
+        self.ceil_result = label("", "status", wrap=True)
+        hgt.pack_start(self.ceil_result, False, False, 0)
+
+        box.pack_start(self.two_columns(show, hgt), False, False, 0)
+        self.ceil_status = label("", "desc", wrap=True)
+        box.pack_start(self.ceil_status, False, False, 0)
+        return box
+
+    def show_ceiling_page(self):
+        self.stack.set_visible_child_name("Ceiling")
+        self.refresh_ceiling_status()
+
+    def refresh_ceiling_status(self):
+        c = ceiling.load()
+        on = bool(c["enabled"]) and ceiling.any_mode(c)
+        running = ceiling.service_active()
+        self.ceil_status.set_text(
+            ("Indicator running. " if running else "Indicator off. " if not on else "Indicator should be on but "
+             "isn't running yet. ") +
+            ("Height not measured yet: using the value above." if not c.get("measured") else
+             f"Ceiling {c['height']:.2f} m above the floor."))
+
+    def ceiling_save(self, c, message=None):
+        ceiling.save(c)
+        if c.get("upmarker") and c.get("enabled"):
+            self.render_ceiling_markers()
+        ok, msg = ceiling.apply_service(c)
+        if message:
+            set_result(self.ceil_result, message if ok else f"{message} (but: {msg})", ok)
+        self.refresh_ceiling_status()
+
+    def on_ceiling_switch(self, sw, _pspec, key):
+        if getattr(self, "_ceil_loading", False):
+            return
+        c = ceiling.load()
+        c[key] = 1 if sw.get_active() else 0
+        if key != "enabled" and sw.get_active() and not c["enabled"]:
+            c["enabled"] = 1  # turning a mode on turns the indicator on
+            self._ceil_loading = True
+            self.ceil_switches["enabled"].set_active(True)
+            self._ceil_loading = False
+        if c["enabled"] and (c["cx"], c["cz"]) == (0.0, 0.0):
+            c["cx"], c["cz"] = ceiling.play_area_centre()
+        self.ceiling_save(c)
+
+    def on_ceiling_height(self, cm):
+        c = ceiling.load()
+        c["height"] = round(cm / 100, 2)
+        self.ceiling_save(c)
+
+    def on_ceiling_measure(self, *_):
+        self.ceil_measure_btn.set_sensitive(False)
+        set_result(self.ceil_result, "Hold a controller flat against the ceiling now…", True)
+
+        def done(result):
+            self.ceil_measure_btn.set_sensitive(True)
+            if isinstance(result, Exception):
+                set_result(self.ceil_result, f"Couldn't measure: {result}", False)
+                return
+            (height, n), (cx, cz) = result
+            c = ceiling.load()
+            c.update(height=height, cx=cx, cz=cz, measured=1)
+            self.ceil_height.set(int(round(height * 100)))
+            self.ceiling_save(c, f"Ceiling: {height:.2f} m above the floor ({n} readings).")
+        in_background(lambda: (ceiling.measure(), ceiling.play_area_centre()), done)
+
+    def render_ceiling_markers(self):
+        os.makedirs(ceiling.DATA, exist_ok=True)
+        try:
+            with HudRenderer() as r:
+                r.render("Real ceiling", "UP", os.path.join(ceiling.DATA, "up.rgba"))
+                r.render("Real floor", "DOWN", os.path.join(ceiling.DATA, "down.rgba"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def build_room_preview_page(self):
+        """The big preview (no menu entry: opened from a room's Preview button)."""
+        self.preview_box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18), "page")
+        return self.preview_box
+
+    def show_room_preview(self, m, current=False):
+        for child in self.preview_box.get_children():
+            self.preview_box.remove(child)
+        head = Gtk.Box(spacing=18)
+        back = Gtk.Button(label="‹ Back to rooms")
+        back.connect("clicked", lambda *_: self.show_page("Rooms"))
+        head.pack_start(back, False, False, 0)
+        head.pack_start(label(("Room in use now" if current else m.get("name", "Room")), "page-title"),
+                        False, False, 0)
+        self.preview_box.pack_start(head, False, False, 0)
+
+        row = Gtk.Box(spacing=26)
+        img = Gtk.Image()
+        try:
+            img.set_from_pixbuf(self.room_preview(m, w=1000, h=760, grid=True))
+        except GLib.Error:
+            pass
+        row.pack_start(img, False, False, 0)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        facts = []
+        if not current and m.get("saved"):
+            facts.append("Saved " + time.strftime("%a %b %d, %I:%M %p", time.localtime(m["saved"])))
+        if m.get("outline"):
+            xs, zs = [p[0] for p in m["outline"]], [p[1] for p in m["outline"]]
+            facts += [f"Size: about {max(xs) - min(xs):.1f} × {max(zs) - min(zs):.1f} m",
+                      f"Floor inside the boundary: {m.get('area', 0)} m²",
+                      f"Boundary points: {m.get('walls', 0)}"]
+        facts.append(f"Room map: {m.get('map_mb', 0)} MB")
+        side.pack_start(label("\n".join(facts), "status", wrap=True), False, False, 0)
+        side.pack_start(label("White dot: where you stand when the room starts.\nWhite line: the way you face.\n"
+                              "Blue: the area inside your boundary.", "desc", wrap=True), False, False, 0)
+        if not current:
+            side.pack_start(ConfirmButton("Load this room", "Tap again: restarts VR",
+                                          lambda: self.load_room(m["id"], m.get("name")), css="primary"),
+                            False, False, 0)
+        row.pack_start(side, True, True, 0)
+        self.preview_box.pack_start(row, False, False, 0)
+        self.preview_box.show_all()
+        self.stack.set_visible_child_name("RoomPreview")
+
+    def refresh_rooms(self):
+        def facts(m):
+            if not m.get("maps"):
+                return "No room map yet."
+            return f"{m['area']} m² boundary · map {m['map_mb']} MB"
+        now = rooms.current()
+        try:
+            self.room_now_img.set_from_pixbuf(self.room_preview(now))
+        except GLib.Error:
+            pass
+        self.room_now_lbl.set_text(facts(now))
+        self.undo_btn.set_sensitive(rooms.backup_exists())
+
+        for child in self.rooms_grid_holder.get_children():
+            self.rooms_grid_holder.remove(child)
+        saved = rooms.list_rooms()
+        cards_ = []
+        for m in saved:
+            c = card()
+            row = Gtk.Box(spacing=18)
+            img = Gtk.Image()
+            try:
+                img.set_from_pixbuf(self.room_preview(m))
+            except GLib.Error:
+                pass
+            row.pack_start(img, False, False, 0)
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            col.pack_start(label(m.get("name", "Room"), "card-title", wrap=True), False, False, 0)
+            when = time.strftime("%b %d, %I:%M %p", time.localtime(m.get("saved", 0)))
+            col.pack_start(label(f"Saved {when}\n{facts(m)}", "desc", wrap=True), False, False, 0)
+            btns = Gtk.Box(spacing=10, homogeneous=True)
+            prev = Gtk.Button(label="Preview")
+            prev.connect("clicked", lambda _b, room=m: self.show_room_preview(room))
+            btns.pack_start(prev, True, True, 0)
+            btns.pack_start(ConfirmButton("Load", "Tap again: restarts VR",
+                                          lambda rid=m["id"], n=m.get("name"): self.load_room(rid, n),
+                                          css="primary"), True, True, 0)
+            col.pack_start(btns, False, False, 0)
+            row.pack_start(col, True, True, 0)
+            c.pack_start(row, False, False, 0)
+
+            # rename + delete
+            edit = Gtk.Box(spacing=10)
+            entry = Gtk.Entry(text=m.get("name", ""))
+            edit.pack_start(entry, True, True, 0)
+            ren = Gtk.Button(label="Rename")
+            ren.connect("clicked", lambda _b, rid=m["id"], e=entry: self.rename_room(rid, e.get_text()))
+            edit.pack_start(ren, False, False, 0)
+            edit.pack_start(ConfirmButton("Delete", "Tap again", lambda rid=m["id"], n=m.get("name"):
+                                          self.delete_room(rid, n), css="primary"), False, False, 0)
+            c.pack_start(edit, False, False, 0)
+            cards_.append(c)
+        if cards_:
+            grid = self.two_columns(*cards_)
+            grid.set_hexpand(True)
+            self.rooms_grid_holder.pack_start(grid, True, True, 0)
+        else:
+            self.rooms_grid_holder.pack_start(label("None yet. Save the room you're in above.", "desc"),
+                                              False, False, 0)
+        self.rooms_grid_holder.show_all()
+
+    def reset_save_button(self):
+        self._replace_armed = (None, 0)
+        self.room_save_btn.set_label("Save")
+        self.room_save_btn.get_style_context().remove_class("armed")
+
+    def on_save_room(self, *_):
+        name = self.room_name.get_text().strip() or "Room"
+        existing = rooms.find_by_name(name)
+        armed_name, until = self._replace_armed
+        if existing and not (armed_name == name and time.time() < until):
+            self._replace_armed = (name, time.time() + 5)
+            self.room_save_btn.set_label(f"Tap again to replace '{name}'")
+            self.room_save_btn.get_style_context().add_class("armed")
+            GLib.timeout_add(5000, lambda: (self.reset_save_button(), False)[1])
+            return
+        self.reset_save_button()
+        set_result(self.rooms_result, f"Saving '{name}'…", True)
+
+        def done(result):
+            if isinstance(result, Exception):
+                set_result(self.rooms_result, f"Couldn't save: {result}", False)
+            else:
+                set_result(self.rooms_result, f"Saved this room as '{name}'.", True)
+            self.refresh_rooms()
+        in_background(lambda: rooms.save(name, existing), done)
+
+    def rename_room(self, rid, name):
+        if not name.strip():
+            set_result(self.rooms_result, "Type a name first.", False)
+            return
+        rooms.rename(rid, name)
+        set_result(self.rooms_result, f"Renamed to '{name.strip()}'.", True)
+        self.refresh_rooms()
+
+    def delete_room(self, rid, name):
+        rooms.delete(rid)
+        set_result(self.rooms_result, f"Deleted '{name}'.", True)
+        self.refresh_rooms()
+
+    def load_room(self, rid, name):
+        ok, msg = rooms.start_load(rid)
+        set_result(self.rooms_result, f"Loading '{name}': SteamVR restarts now. Reopen Deckhand in a moment."
+                   if ok else f"Couldn't load: {msg}", ok)
+
+    # ============================================================ recline
+    def build_recline(self):
+        box = self.page("Recline")
+        c = card(None, "Recline VR lets you play lying down. Lie back and use SteamVR's recenter (it reclines "
+                       "once you're tilted past 35°), or use the buttons below.")
+        self.recline_lbl = label("", "status", wrap=True)
+        c.pack_start(self.recline_lbl, False, False, 0)
+        row = Gtk.Box(spacing=18, homogeneous=True)
+        self.recline_btns = []
+        for text, args in (("Recline to where I'm looking", ["recenter"]), ("Back to normal", ["reset"])):
+            b = add_class(Gtk.Button(label=text), "tile")
+            b.connect("clicked", self.on_recline, args, text)
+            row.pack_start(b, True, True, 0)
+            self.recline_btns.append(b)
+        c.pack_start(row, False, False, 0)
+        self.recline_result = label("", "status")
+        c.pack_start(self.recline_result, False, False, 0)
+        c.pack_start(label("In any game: hold both grips and click both thumbsticks for Recline's own panel "
+                           "(tilt angle, eye height).", "desc", wrap=True), False, False, 0)
+        box.pack_start(c, False, False, 0)
+        return box
+
+    def refresh_recline(self):
+        avail = recline_available()
+        for b in self.recline_btns:
+            b.set_sensitive(avail)
+        self.recline_lbl.set_text("Checking…")
+        in_background(recline_status, lambda s: self.recline_lbl.set_text(str(s)))
+
+    def on_recline(self, _btn, args, text):
+        def done(result):
+            rc, out = result if isinstance(result, tuple) else (1, str(result))
+            set_result(self.recline_result, f"{text}: done" if rc == 0 else f"Failed: {out[-200:]}", rc == 0)
+            self.refresh_recline()
+        in_background(lambda: run([RECLINECTL, *args], env=vr_tool_env()), done)
+
+    # ============================================================= system
+    def build_system(self):
+        box = self.page("System")
+        info = card("This headset")
+        self.sys_lbl = label("", "status", selectable=True, wrap=True)
+        info.pack_start(self.sys_lbl, False, False, 0)
+        restart = card("Restart SteamVR", "Fixes most glitches. Closes everything that is open, including "
+                                          "this app; VR comes back in a few seconds.")
+        restart.pack_start(ConfirmButton("Restart SteamVR", "Tap again to restart", self.do_restart_steamvr,
+                                         css="primary"), False, False, 0)
+        box.pack_start(self.two_columns(info, restart), False, False, 0)
+
+        upd = card("Update app", "Gets the newest Deckhand from GitHub. Your settings, rooms, maps and "
+                                 "timers stay as they are.")
+        self.upd_lbl = label(f"Installed: version {updater.local_version()}", "status", wrap=True)
+        upd.pack_start(self.upd_lbl, False, False, 0)
+        self.upd_btn = add_class(Gtk.Button(label="Check for updates"), "primary")
+        self.upd_btn.connect("clicked", self.on_update_button)
+        upd.pack_start(self.upd_btn, False, False, 0)
+        self.upd_new = None
+        share = card("Share with a friend", "On their Steam Frame, in Desktop mode, open Konsole and paste:")
+        cmd = label(f"curl -fsSL https://raw.githubusercontent.com/{updater.REPO}/main/install.sh | bash",
+                    "status", wrap=True, selectable=True)
+        share.pack_start(cmd, False, False, 0)
+        share.pack_start(label(f"github.com/{updater.REPO}", "desc", selectable=True), False, False, 0)
+        box.pack_start(self.two_columns(upd, share), False, False, 0)
+        box.pack_start(label(f"Deckhand lives in {HERE}", "desc", wrap=True), False, False, 0)
+        return box
+
+    def on_update_button(self, *_):
+        if self.upd_new:  # second tap: install
+            self.upd_btn.set_sensitive(False)
+            self.upd_lbl.set_text(f"Updating to version {self.upd_new}…")
+
+            def done(res):
+                self.upd_btn.set_sensitive(True)
+                if isinstance(res, Exception):
+                    set_result(self.upd_lbl, f"Update failed: {res}", False)
+                    return
+                set_result(self.upd_lbl, f"Updated to version {res}. Restarting the app…", True)
+                GLib.timeout_add(1500, self.restart_self)
+            in_background(lambda: updater.install(log=lambda _m: None), done)
+            return
+        self.upd_btn.set_sensitive(False)
+        self.upd_lbl.set_text("Checking GitHub…")
+
+        def checked(res):
+            self.upd_btn.set_sensitive(True)
+            if isinstance(res, Exception):
+                set_result(self.upd_lbl, f"Couldn't reach GitHub ({res}). Is the Frame online?", False)
+                return
+            here, there, newer = res
+            if newer:
+                self.upd_new = there
+                set_result(self.upd_lbl, f"Version {there} is out (you have {here}).", True)
+                self.upd_btn.set_label(f"Update to {there}")
+            else:
+                set_result(self.upd_lbl, f"Up to date: version {here}.", True)
+        in_background(updater.check, checked)
+
+    def restart_self(self):
+        """Starts the new version in place of this one (same process, so Steam still counts it as running)."""
+        if getattr(self, "wifi_rec", None):
+            self.stop_wifi_mapping()
+        if getattr(self, "house_rec", None):
+            self.stop_house_walk()
+        os.execv(sys.executable, [sys.executable, os.path.join(HERE, "frame_settings.py")])
+        return False
+
+    def refresh_system(self):
+        pct, chg = battery()
+        lines = [f"Battery: {pct}%" + (" (charging)" if chg else "") if pct is not None else "Battery: unknown",
+                 f"Name: {socket.gethostname()}",
+                 "Network:\n  " + "\n  ".join(ip_addresses()),
+                 "SteamVR: " + ("running" if steamvr_running() else "not running")]
+        self.sys_lbl.set_text("\n".join(lines))
+
+    def do_restart_steamvr(self):
+        subprocess.Popen(["systemctl", "--user", "restart", "--no-block", "steamvr.service"],
+                         start_new_session=True)
+
+
+def snapshot(prefix):
+    """Render every page to PNGs as a real full-screen window.
+
+    Only on a virtual display, so nothing ever pops up in the headset, e.g.:
+      GDK_DPI_SCALE=1.5 xvfb-run -a -s "-screen 0 1920x1080x24" python3 frame_settings.py --snapshot /tmp/x
+    (GDK_DPI_SCALE=1.5 matches the headset's 144 dpi text scaling.)
+    """
+    if os.environ.get("DISPLAY") in (":0", ":1"):
+        raise SystemExit("snapshot only runs on a virtual display (xvfb-run), never on the headset's")
+    win = FrameSettings()
+    win.show_all()
+    win.show_setup(not win.setup_ready)
+    win.fullscreen()
+    print("window minimum width:", win.get_preferred_width()[0],
+          "| screen:", Gdk.Screen.get_default().get_width())
+    shots = [(name, lambda name=name: win.show_page(name)) for name, _icon in win.PAGES] + [
+        ("WifiMap", win.show_wifi_page),
+        ("House", win.show_house_page),
+        ("House-dongle", lambda: (win.house_target_seg.set_value("dongle"), win.on_house_target("dongle"))),
+        ("Ceiling", win.show_ceiling_page)]
+    if win.house_m:  # the mini-map, as it would look in the middle of the house walk
+        smp = win.house_m["samples"][len(win.house_m["samples"]) // 2]
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        wall = (win.house_m.get("walls") or [[smp[0] + 0.6, 1.0, smp[2]]])[-1]
+        loader.write(house_map.minimap_svg(win.house_m, (smp[0], smp[1], smp[2]), (0.6, -0.8), "wifi",
+                                           "Wi-Fi -61 dBm", hands={"right": (wall[0], 1.0, wall[2]),
+                                                                   "left": (smp[0] - 0.25, 1.0, smp[2])},
+                                           on_wall={"right": (wall[0], 1.0, wall[2])}).encode())
+        loader.close()
+        loader.get_pixbuf().savev(f"{prefix}-minimap.png", "png", [], [])
+        print(f"wrote {prefix}-minimap.png")
+    for n, (name, show) in enumerate(shots):
+        show()
+        for _ in range(150):  # let background lookups (e.g. Recline status) and layout finish
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+            time.sleep(0.01)
+        gw = win.get_window()
+        pix = Gdk.pixbuf_get_from_window(gw, 0, 0, gw.get_width(), gw.get_height())
+        pix.savev(f"{prefix}-{n}.png", "png", [], [])
+        print(f"wrote {prefix}-{n}.png {name} ({pix.get_width()}x{pix.get_height()})")
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--snapshot":
+        snapshot(sys.argv[2])
+        return
+    win = FrameSettings()
+    win.show_all()
+    win.show_setup(not win.setup_ready)
+    if os.environ.get("SteamGamepadUI") or os.environ.get("SteamTenfoot"):
+        win.fullscreen()  # in VR: fill the whole screen
+    else:
+        win.maximize()    # desktop mode
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

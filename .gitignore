@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+*.new
+/timer_overlay
+/chaperone_tool
+/space_tool
+/ceiling_overlay
