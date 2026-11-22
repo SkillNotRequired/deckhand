@@ -3,8 +3,7 @@
 //   space_tool bounds            boundary outline on the floor, standing space: "b x z" lines
 //   space_tool track <ms>        every <ms>: "p <device> <valid> x y z fx fz" for the headset
 //                                (device "hmd") and controllers ("left", "right"); fx/fz is
-//                                the device's forward direction on the floor; plus for each
-//                                controller "k <device> <trigger 0..1> <pressed-button mask hex>"
+//                                the device's forward direction on the floor
 //
 // Standing space: metres, floor at y = 0, x right, -z forward (the same space as the
 // boundary). Connects as a background app: never starts SteamVR, takes no focus,
@@ -85,9 +84,6 @@ static int track(int ms) {
             if (printf("p %s %d %.3f %.3f %.3f %.3f %.3f\n", d.name, int(p.bPoseIsValid && p.bDeviceIsConnected),
                        m[0][3], m[1][3], m[2][3], fx, fz) < 0)
                 return 0;
-            vr::VRControllerState_t st{};
-            if (d.idx != vr::k_unTrackedDeviceIndex_Hmd && sys->GetControllerState(d.idx, &st, sizeof st))
-                printf("k %s %.2f %llx\n", d.name, st.rAxis[1].x, (unsigned long long)st.ulButtonPressed);
         }
         if (fflush(stdout) != 0) return 0;
         usleep(useconds_t(ms) * 1000);

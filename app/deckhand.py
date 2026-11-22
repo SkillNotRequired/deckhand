@@ -771,6 +771,8 @@ class FrameSettings(Gtk.Window):
             self.stop_wifi_mapping()
         if getattr(self, "house_rec", None):
             self.stop_house_walk()
+        if getattr(self, "house_watch", None):
+            self.house_watch_stop()
         Gtk.main_quit()
 
     def on_focus_change(self, _w, _ev, focused):
@@ -809,6 +811,8 @@ class FrameSettings(Gtk.Window):
         return rail
 
     def show_page(self, name):
+        if name != "House" and getattr(self, "house_watch", None):
+            self.house_watch_stop()  # only follow the headset while the house map is on screen
         self.stack.set_visible_child_name(name)
         nav_name = {"RoomPreview": "Rooms", "Ceiling": "Rooms", "WifiMap": "Signal", "House": "Signal"}.get(name, name)
         for n, b in self.nav.items():
@@ -1812,12 +1816,19 @@ class FrameSettings(Gtk.Window):
         return loader.get_pixbuf()
 
     # ==================================================== whole-house map
+    MAP_W, MAP_H = 820, 660  # house map picture, pixels
+
     def build_house_page(self):
         self.house_rec = None
+        self.house_watch = None   # PoseWatcher while the page is open and no walk runs
         self.house_m = house_map.load()
         self.house_floor = 0
         self.house_target = "wifi"
         self._house_xf = None
+        self.house_prefs = house_map.prefs()
+        self.house_view = {"angle": float(self.house_prefs.get("angle", 0)), "zoom": 1.0, "pan": [0.0, 0.0]}
+        self._drag = None
+        self._drag_redraw = False
         box = add_class(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16), "page")
         head = Gtk.Box(spacing=18)
         back = Gtk.Button(label="‹ Back to Signal")
@@ -1830,10 +1841,25 @@ class FrameSettings(Gtk.Window):
         self.house_floor_box = Gtk.Box()
         left.pack_start(self.house_floor_box, False, False, 0)
         ev = Gtk.EventBox()
+        ev.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                      Gdk.EventMask.BUTTON1_MOTION_MASK | Gdk.EventMask.SCROLL_MASK)
         self.house_img = Gtk.Image()
         ev.add(self.house_img)
-        ev.connect("button-press-event", self.on_house_click)
+        ev.connect("button-press-event", self.on_map_press)
+        ev.connect("motion-notify-event", self.on_map_drag)
+        ev.connect("button-release-event", self.on_map_release)
+        ev.connect("scroll-event", self.on_map_scroll)
         left.pack_start(ev, False, False, 0)
+        for row_items in ((("⟲ Rotate", lambda: self.map_view(angle=-15)), ("Rotate ⟳", lambda: self.map_view(angle=15)),
+                           ("Reset view", self.map_reset)),
+                          (("− Zoom out", lambda: self.map_view(zoom=1 / 1.25)), ("Zoom in +", lambda: self.map_view(zoom=1.25)),
+                           ("Center on me", self.map_center_me))):
+            view = Gtk.Box(spacing=8, homogeneous=True)  # map view controls (drag the map to move it)
+            for text, act in row_items:
+                b = Gtk.Button(label=text)
+                b.connect("clicked", lambda _b, a=act: a())
+                view.pack_start(b, True, True, 0)
+            left.pack_start(view, False, False, 0)
         row.pack_start(left, False, False, 0)
 
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -1851,18 +1877,10 @@ class FrameSettings(Gtk.Window):
         acts.pack_start(self.house_btn, True, True, 0)
         acts.pack_start(ConfirmButton("Clear map", "Tap again to clear", self.on_house_clear), True, True, 0)
         side.pack_start(acts, False, False, 0)
-        self.house_prefs = house_map.prefs()
-        self.wall_switch = Gtk.Switch(active=self.house_prefs["walls"])
-        self.wall_switch.connect("notify::active", self.on_house_pref, "walls")
-        side.pack_start(switch_row("Wall detection", label("Touch a wall with a controller and hold the trigger "
-                                                           "while you walk along it. Holding your arm out at "
-                                                           "shoulder height for a second works too.",
-                                                           "desc", wrap=True),
-                                   self.wall_switch), False, False, 0)
         self.minimap_switch = Gtk.Switch(active=self.house_prefs["minimap"])
         self.minimap_switch.connect("notify::active", self.on_house_pref, "minimap")
-        side.pack_start(switch_row("Mini-map in view", label("Low on the left while you walk, like in a game; "
-                                                             "turns with you.", "desc", wrap=True),
+        side.pack_start(switch_row("Mini-map in view", label("In the middle of your view while you walk, like "
+                                                             "in a game; turns with you.", "desc", wrap=True),
                                    self.minimap_switch), False, False, 0)
         self.house_progress = label(
             "Walk every room with the headset on (passthrough helps). Wi-Fi and the Steam dongle are "
@@ -1903,6 +1921,27 @@ class FrameSettings(Gtk.Window):
     def show_house_page(self):
         self.show_page("House")
 
+    def house_watch_start(self):
+        """Follows the headset for the "You" marker while this page is open (a walk does it itself)."""
+        if self.house_watch or (self.house_rec and self.house_rec.running) or "--snapshot" in sys.argv:
+            return
+        try:
+            self.house_watch = house_map.PoseWatcher().start()
+        except Exception:  # noqa: BLE001  (no helper / SteamVR not running: just no marker)
+            self.house_watch = None
+
+    def house_watch_stop(self):
+        if self.house_watch:
+            self.house_watch.stop()
+            self.house_watch = None
+
+    def house_you(self):
+        """(x, y, z, (fx, fz)) of the headset for the map, or None."""
+        src = self.house_rec if (self.house_rec and self.house_rec.running) else self.house_watch
+        if src and src.pose:
+            return (*src.pose, src.heading)
+        return None
+
     def on_house_target(self, target):
         self.house_target = target
         self.refresh_house(full=True)
@@ -1936,27 +1975,25 @@ class FrameSettings(Gtk.Window):
             line("Steam dongle", dongle, "not connected (PC dongle off or asleep)"))
         if rec and rec.running:
             el = int(rec.elapsed())
-            hint = ""
-            if not rec.pose:
-                hint = " · headset not tracking: put it on"
-            elif rec.trace_walls and not rec.trigger_ok() and el > 5:
-                hint = (" · the trigger only works with this window closed: close the dashboard, or hold "
-                        "a controller out against the wall at shoulder height")
             self.house_progress.set_text(f"Walking: {el // 60}:{el % 60:02d} · {rec.distance:.0f} m · "
-                                         f"{len(rec.samples)} readings · {len(rec.walls)} wall points" + hint)
+                                         f"{len(rec.samples)} readings" +
+                                         ("" if rec.pose else " · headset not tracking: put it on"))
             self.draw_house(house_map.add_walk(self.copy_house(), rec))
             return
-        if full:
+        self.house_watch_start()
+        if full or self.house_watch:  # the "You" marker moves with you
             self.draw_house(self.house_m or {})
+        if full:
             self.show_house_result()
 
     def copy_house(self):
         m = self.house_m
         if not m:
             return None
-        return dict(m, samples=list(m.get("samples", [])), walls=list(m.get("walls", [])))
+        return dict(m, samples=list(m.get("samples", [])))
 
     def draw_house(self, m):
+        self._house_drawn = m
         samples = m.get("samples") or []
         fl = house_map.floors(samples) if samples else [0]
         if self.house_floor not in fl:
@@ -1970,26 +2007,126 @@ class FrameSettings(Gtk.Window):
             self.house_floor_box.pack_start(seg, True, True, 0)
             self.house_floor_box.show_all()
         pix, self._house_xf = self.house_svg(m, self.house_floor, self.house_target,
-                                             selected=getattr(self, "_label_sel", None))
+                                             selected=getattr(self, "_label_sel", None),
+                                             view=self.house_view, you=self.house_you(),
+                                             w=self.MAP_W, h=self.MAP_H)
         self.house_img.set_from_pixbuf(pix)
 
+    # ---- map view: rotate / zoom / pan (drag) / center on me / reset
+    def map_view(self, angle=0, zoom=1.0):
+        v = self.house_view
+        v["angle"] = (v["angle"] + angle) % 360
+        v["zoom"] = max(0.4, min(6.0, v["zoom"] * zoom))
+        if zoom != 1.0:  # zoom around the middle of the map
+            k = zoom if 0.4 < v["zoom"] < 6.0 else 1.0
+            v["pan"] = [v["pan"][0] * k, v["pan"][1] * k]
+        if angle:
+            self.house_prefs["angle"] = v["angle"]
+            house_map.save_prefs(self.house_prefs)
+        self.redraw_house()
+
+    def map_reset(self):
+        self.house_view.update(angle=0.0, zoom=1.0, pan=[0.0, 0.0])
+        self.house_prefs["angle"] = 0
+        house_map.save_prefs(self.house_prefs)
+        self.redraw_house()
+
+    def map_center_me(self):
+        you, xf = self.house_you(), self._house_xf
+        if not you or not xf:
+            self.label_status.set_text("Your position isn't known right now (headset not tracking?).")
+            return
+        sx, sy = self.house_view_point(xf, you[0], you[2], pan=False)
+        self.house_view["pan"] = [xf["w"] / 2 - sx, xf["hm"] / 2 - sy]
+        self.redraw_house()
+
+    def redraw_house(self):
+        m = getattr(self, "_house_drawn", None)
+        self.draw_house(m if m is not None else (self.house_m or {}))
+
     @staticmethod
-    def house_svg(m, floor, target="wifi", w=820, h=740, selected=None):
-        """Top-down map of one floor: 0.5 m squares by the chosen signal, traced walls (solid), the edge
-        of the walked area (dashed), the path, labels, a 1 m scale. Returns (pixbuf, transform), the
-        transform mapping image pixels back to metres for labelling."""
+    def house_view_point(xf, x, z, pan=True):
+        """Metres → map pixels with the view's rotation, zoom and (optionally) pan."""
+        dx, dz = x - xf["cx"], z - xf["cz"]
+        rx = dx * xf["cos"] - dz * xf["sin"]
+        rz = dx * xf["sin"] + dz * xf["cos"]
+        px, py = xf["pan"] if pan else (0.0, 0.0)
+        return xf["w"] / 2 + rx * xf["s"] + px, xf["hm"] / 2 + rz * xf["s"] + py
+
+    @staticmethod
+    def house_view_metres(xf, sx, sy):
+        """Map pixels → metres (inverse of house_view_point)."""
+        rx = (sx - xf["w"] / 2 - xf["pan"][0]) / xf["s"]
+        rz = (sy - xf["hm"] / 2 - xf["pan"][1]) / xf["s"]
+        return (xf["cx"] + rx * xf["cos"] + rz * xf["sin"], xf["cz"] - rx * xf["sin"] + rz * xf["cos"])
+
+    def _map_xy(self, event):
+        pix = self.house_img.get_pixbuf()
+        alloc = self.house_img.get_allocation()
+        return (event.x - (alloc.width - pix.get_width()) / 2, event.y - (alloc.height - pix.get_height()) / 2)
+
+    def on_map_press(self, _w, event):
+        if event.button == 1 and self._house_xf:
+            x, y = self._map_xy(event)
+            self._drag = {"x": x, "y": y, "pan": list(self.house_view["pan"]), "moved": False}
+        return True
+
+    def on_map_drag(self, _w, event):
+        d = self._drag
+        if not d:
+            return False
+        x, y = self._map_xy(event)
+        if not d["moved"] and math.hypot(x - d["x"], y - d["y"]) < 14:
+            return True  # small wobble: still a tap
+        d["moved"] = True
+        self.house_view["pan"] = [d["pan"][0] + x - d["x"], d["pan"][1] + y - d["y"]]
+        if not self._drag_redraw:  # redraw at most ~12 times a second while dragging
+            self._drag_redraw = True
+            GLib.timeout_add(80, self._drag_tick)
+        return True
+
+    def _drag_tick(self):
+        self._drag_redraw = False
+        self.redraw_house()
+        return False
+
+    def on_map_release(self, _w, event):
+        d, self._drag = self._drag, None
+        if not d:
+            return False
+        if d["moved"]:
+            self.redraw_house()
+        else:
+            self.on_house_tap(event)
+        return True
+
+    def on_map_scroll(self, _w, event):
+        if event.direction == Gdk.ScrollDirection.UP:
+            self.map_view(zoom=1.25)
+        elif event.direction == Gdk.ScrollDirection.DOWN:
+            self.map_view(zoom=1 / 1.25)
+        return True
+
+    @staticmethod
+    def house_svg(m, floor, target="wifi", w=820, h=700, selected=None, view=None, you=None):
+        """Top-down map of one floor: 0.5 m squares by the chosen signal, the edge of the walked area
+        (dashed), the path, labels, you, a scale bar and the signal legend. `view` rotates, zooms and
+        pans it. Returns (pixbuf, transform) — the transform maps pixels back to metres for taps."""
+        view = view or {"angle": 0.0, "zoom": 1.0, "pan": [0.0, 0.0]}
         samples = m.get("samples") or []
         base = house_map.floor_base(samples) if samples else 0
         on_floor = [s for s in samples if house_map.floor_of(s[1], base) == floor]
         walked = {(i, j) for f, i, j in house_map.footprint(samples) if f == floor} if samples else set()
         cs = {(i, j): v for (f, i, j), v in house_map.cells(samples, target).items() if f == floor} if samples else {}
-        walls = house_map.wall_lines(m, floor) if samples else []
         labels = [(i, l) for i, l in enumerate(m.get("labels", [])) if l.get("floor", 0) == floor]
+        here = you if you and samples and house_map.floor_of(you[1], base) == floor else None
         bg = "#141b24"
-        xs = ([(i + d) * house_map.CELL for (i, _j) in walked for d in (0, 1)] + [l["x"] for _i, l in labels]
-              + [x for ln in walls for x, _z in ln] + [0])
-        zs = ([(j + d) * house_map.CELL for (_i, j) in walked for d in (0, 1)] + [l["z"] for _i, l in labels]
-              + [z for ln in walls for _x, z in ln] + [0])
+        foot = 96
+        hm = h - foot
+        xs = ([(i + d) * house_map.CELL for (i, _j) in walked for d in (0, 1)] + [l["x"] for _i, l in labels] + [0]
+              + ([here[0]] if here else []))
+        zs = ([(j + d) * house_map.CELL for (_i, j) in walked for d in (0, 1)] + [l["z"] for _i, l in labels] + [0]
+              + ([here[2]] if here else []))
         xf = None
         if not walked:
             svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">'
@@ -1997,47 +2134,48 @@ class FrameSettings(Gtk.Window):
                    f'<text x="{w / 2}" y="{h / 2}" fill="#9fb3c8" font-size="28" text-anchor="middle" '
                    f'font-family="sans-serif">No house map yet: press Start walking</text></svg>')
         else:
-            minx, maxx, minz, maxz = min(xs) - 0.5, max(xs) + 0.5, min(zs) - 0.5, max(zs) + 0.5
-            pad, foot = 20, 104
-            s = min((w - 2 * pad) / (maxx - minx), (h - 2 * pad - foot) / (maxz - minz))
-            ox = (w - (maxx - minx) * s) / 2
-            oz = (h - foot - (maxz - minz) * s) / 2
-            xf = (minx, minz, s, ox, oz)
+            cx, cz = (min(xs) + max(xs)) / 2, (min(zs) + max(zs)) / 2
+            th = math.radians(view["angle"])
+            co, si = math.cos(th), math.sin(th)
+            rxs = [(x - cx) * co - (z - cz) * si for x, z in zip(xs, zs)]
+            rzs = [(x - cx) * si + (z - cz) * co for x, z in zip(xs, zs)]
+            pad = 30
+            fit = min((w - 2 * pad) / (max(rxs) - min(rxs) + 1.0), (hm - 2 * pad) / (max(rzs) - min(rzs) + 1.0))
+            s = fit * view["zoom"]
+            xf = {"cx": cx, "cz": cz, "cos": co, "sin": si, "s": s, "pan": list(view["pan"]), "w": w, "hm": hm}
 
             def P(x, z):
-                return ox + (x - minx) * s, oz + (z - minz) * s
-            cw = house_map.CELL * s + 0.5
-            parts = [f'<rect width="{w}" height="{h}" rx="14" fill="{bg}"/>']
-            for (i, j) in walked:  # floor where you walked (grey where this signal wasn't measured)
-                if (i, j) not in cs:
-                    x0, z0 = P(i * house_map.CELL, j * house_map.CELL)
-                    parts.append(f'<rect x="{x0:.1f}" y="{z0:.1f}" width="{cw:.1f}" height="{cw:.1f}" '
-                                 f'fill="#2a3440"/>')
-            for (i, j), (dbm, _tx, _n) in cs.items():
-                x0, z0 = P(i * house_map.CELL, j * house_map.CELL)
-                parts.append(f'<rect x="{x0:.1f}" y="{z0:.1f}" width="{cw:.1f}" height="{cw:.1f}" '
-                             f'fill="{wifi_map.fill(dbm)}" fill-opacity="0.9"/>')
-            for xa, za, xb, zb in house_map.outline_edges(samples, floor):  # estimated walls: edge of the walked area
+                return FrameSettings.house_view_point(xf, x, z)
+
+            def poly(corners):
+                return " ".join("%.1f,%.1f" % P(x, z) for x, z in corners)
+            C = house_map.CELL
+            parts = [f'<rect width="{w}" height="{h}" rx="14" fill="{bg}"/>',
+                     f'<defs><clipPath id="mapclip"><rect x="0" y="0" width="{w}" height="{hm}" rx="14"/></clipPath>'
+                     f'</defs><g clip-path="url(#mapclip)">']
+            for (i, j) in walked:  # floor where you walked; grey where this signal wasn't measured
+                v = cs.get((i, j))
+                x0, z0 = i * C, j * C
+                parts.append(f'<polygon points="{poly(((x0, z0), (x0 + C, z0), (x0 + C, z0 + C), (x0, z0 + C)))}" '
+                             f'fill="{wifi_map.fill(v[0]) if v else "#2a3440"}" fill-opacity="0.9" '
+                             f'stroke="{wifi_map.fill(v[0]) if v else "#2a3440"}" stroke-width="0.8"/>')
+            for xa, za, xb, zb in house_map.outline_edges(samples, floor):  # edge of where you walked
                 (ax, az), (bx, bz) = P(xa, za), P(xb, zb)
                 parts.append(f'<line x1="{ax:.1f}" y1="{az:.1f}" x2="{bx:.1f}" y2="{bz:.1f}" stroke="#9fd8ff" '
-                             f'stroke-opacity="0.9" stroke-width="3" stroke-dasharray="9 6" stroke-linecap="round"/>')
+                             f'stroke-opacity="0.5" stroke-width="2" stroke-dasharray="7 6"/>')
             seg, pts = None, []
             for smp in on_floor + [[0, 0, 0, None, None, -1]]:  # path, one polyline per segment
                 x, z, sg = smp[0], smp[2], smp[5]
                 if sg != seg and len(pts) > 1:
                     parts.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#ffffff" '
-                                 f'stroke-opacity="0.5" stroke-width="2"/>')
+                                 f'stroke-opacity="0.45" stroke-width="2"/>')
                 if sg != seg:
                     pts, seg = [], sg
                 px, pz = P(x, z)
                 pts.append(f"{px:.1f},{pz:.1f}")
-            for ln in walls:  # traced walls
-                pts = " ".join("%.1f,%.1f" % P(x, z) for x, z in ln)
-                parts.append(f'<polyline points="{pts}" fill="none" stroke="#eef4fa" stroke-width="7" '
-                             f'stroke-linecap="round" stroke-linejoin="round"/>')
             if floor == 0:
                 sx, sz = P(0, 0)
-                parts.append(f'<circle cx="{sx:.1f}" cy="{sz:.1f}" r="8" fill="#ffffff"/>')
+                parts.append(f'<circle cx="{sx:.1f}" cy="{sz:.1f}" r="7" fill="#ffffff"/>')
             for idx, l in labels:  # a dot, its name underneath; the one being moved gets a ring
                 lx, lz = P(l["x"], l["z"])
                 if idx == selected:
@@ -2047,15 +2185,48 @@ class FrameSettings(Gtk.Window):
                              f'stroke-width="3"/><text x="{lx:.1f}" y="{lz + 32:.1f}" fill="#ffffff" '
                              f'font-size="22" font-weight="bold" text-anchor="middle" font-family="sans-serif" '
                              f'stroke="#0e141b" stroke-width="5" paint-order="stroke">{l["name"]}</text>')
-            bar = s  # 1 m scale bar, top left
-            parts.append(f'<rect x="{pad - 6}" y="{pad - 4}" width="{bar + 62:.1f}" height="34" rx="8" fill="{bg}" '
-                         f'fill-opacity="0.8"/><line x1="{pad + 2}" y1="{pad + 13}" x2="{pad + 2 + bar:.1f}" '
-                         f'y2="{pad + 13}" stroke="#c9d6e3" stroke-width="4"/><text x="{pad + bar + 10:.1f}" '
-                         f'y="{pad + 20}" fill="#c9d6e3" font-size="19" font-family="sans-serif">1 m</text>')
-            parts.append(f'<text x="{w / 2}" y="{h - 82}" fill="#c9d6e3" font-size="17" text-anchor="middle" '
-                         f'font-family="sans-serif">{house_map.TARGETS[target]} · white = traced walls · dashed = '
-                         f'estimated walls · grey = not measured · dot = start</text>')
-            parts.append(wifi_map.legend_svg(pad + 10, h - 50, w - 2 * pad - 20))
+            if here:  # you: a big arrow pointing where you look, with a ring and "You"
+                ux, uz = P(here[0], here[2])
+                fx, fz = here[3]
+                hx, hy = fx * co - fz * si, fx * si + fz * co      # look direction on screen
+                n = math.hypot(hx, hy) or 1.0
+                hx, hy = hx / n, hy / n
+                lx, ly = -hy, hx
+                tip = (ux + hx * 30, uz + hy * 30)
+                bl = (ux - hx * 16 + lx * 18, uz - hy * 16 + ly * 18)
+                br = (ux - hx * 16 - lx * 18, uz - hy * 16 - ly * 18)
+                notch = (ux - hx * 6, uz - hy * 6)
+                parts.append(f'<circle cx="{ux:.1f}" cy="{uz:.1f}" r="40" fill="#fde725" fill-opacity="0.18" '
+                             f'stroke="#fde725" stroke-width="3"/>'
+                             f'<polygon points="{tip[0]:.1f},{tip[1]:.1f} {bl[0]:.1f},{bl[1]:.1f} '
+                             f'{notch[0]:.1f},{notch[1]:.1f} {br[0]:.1f},{br[1]:.1f}" fill="#fde725" '
+                             f'stroke="#0e141b" stroke-width="4" stroke-linejoin="round"/>'
+                             f'<text x="{ux:.1f}" y="{uz + 66:.1f}" fill="#fde725" font-size="24" font-weight="bold" '
+                             f'text-anchor="middle" font-family="sans-serif" stroke="#0e141b" stroke-width="6" '
+                             f'paint-order="stroke">You</text>')
+            parts.append("</g>")
+            for metres in (0.5, 1, 2, 5, 10, 20):  # scale bar, top left: 60–220 px long
+                if 60 <= metres * s <= 220 or metres == 20:
+                    break
+            bar = metres * s
+            unit = f"{metres:g} m"
+            parts.append(f'<rect x="12" y="12" width="{bar + 80:.1f}" height="36" rx="8" fill="{bg}" '
+                         f'fill-opacity="0.85"/><line x1="22" y1="30" x2="{22 + bar:.1f}" y2="30" stroke="#c9d6e3" '
+                         f'stroke-width="4"/><text x="{bar + 30:.1f}" y="37" fill="#c9d6e3" font-size="19" '
+                         f'font-family="sans-serif">{unit}</text>')
+            # compass, top right: which way you faced where the map started
+            ccx, ccy = w - 52, 52
+            ax_, ay_ = 0 * co - (-1) * si, 0 * si + (-1) * co
+            parts.append(f'<circle cx="{ccx}" cy="{ccy}" r="34" fill="{bg}" fill-opacity="0.85" stroke="#9fb3c8" '
+                         f'stroke-width="2"/><line x1="{ccx - ax_ * 20:.1f}" y1="{ccy - ay_ * 20:.1f}" '
+                         f'x2="{ccx + ax_ * 22:.1f}" y2="{ccy + ay_ * 22:.1f}" stroke="#ffffff" stroke-width="4" '
+                         f'stroke-linecap="round"/><circle cx="{ccx + ax_ * 22:.1f}" cy="{ccy + ay_ * 22:.1f}" r="5" '
+                         f'fill="#ffffff"/><text x="{ccx}" y="{ccy + 56}" fill="#9fb3c8" font-size="15" '
+                         f'text-anchor="middle" font-family="sans-serif">start</text>')
+            parts.append(f'<text x="{w / 2}" y="{h - 74}" fill="#c9d6e3" font-size="17" text-anchor="middle" '
+                         f'font-family="sans-serif">{house_map.TARGETS[target]} · yellow arrow = you · grey = not measured · '
+                         f'drag to move</text>')
+            parts.append(wifi_map.legend_svg(pad, h - 46, w - 2 * pad))
             svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">{"".join(parts)}</svg>'
         loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
         loader.write(svg.encode())
@@ -2070,8 +2241,7 @@ class FrameSettings(Gtk.Window):
         sm = house_map.summary(m, self.house_target)
         when = time.strftime("%b %d, %I:%M %p", time.localtime(m.get("saved", 0)))
         walks = m.get("walks", 1)
-        head = (f"{walks} walk{'s' if walks != 1 else ''}, last {when}: {m.get('distance', 0):.0f} m, "
-                f"{len(house_map.wall_lines(m, self.house_floor))} wall lines on this floor\n")
+        head = f"{walks} walk{'s' if walks != 1 else ''}, last {when}: {m.get('distance', 0):.0f} m\n"
         if not sm:
             name = house_map.TARGETS[self.house_target]
             self.house_result.set_text(head + f"No {name} readings in this map" +
@@ -2089,6 +2259,7 @@ class FrameSettings(Gtk.Window):
         if self.wifi_rec and self.wifi_rec.running:
             set_result(self.house_progress, "Stop the room Wi-Fi map first.", False)
             return
+        self.house_watch_stop()  # the walk follows the headset itself
         rec = house_map.HouseRecorder()
         segs = [s[5] for s in (self.house_m or {}).get("samples", [])]
         try:
@@ -2096,15 +2267,10 @@ class FrameSettings(Gtk.Window):
         except Exception as e:  # noqa: BLE001
             set_result(self.house_progress, f"Couldn't start: {e}", False)
             return
-        rec.trace_walls = self.house_prefs["walls"]
         self.house_rec = rec
         self.house_btn.set_label("Stop walking")
         self.house_result.set_text("")
-        self.render_house_hud()
         self.set_minimap(self.house_prefs["minimap"])
-        subprocess.run(["systemctl", "--user", "stop", self.WIFI_HUD_UNIT], capture_output=True)
-        subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.WIFI_HUD_UNIT}",
-                        kitchen_timer.BIN, "--live", self.WIFI_HUD], capture_output=True)
         GLib.timeout_add(1000, self.tick_house)
 
     def tick_house(self):
@@ -2114,15 +2280,16 @@ class FrameSettings(Gtk.Window):
         if not rec.running:
             self.stop_house_walk()
             return False
-        self.render_house_hud()
         if self.house_prefs["minimap"]:
             self.render_minimap()
+        else:
+            self.render_house_hud()
         if self.stack.get_visible_child_name() == "House" and int(rec.elapsed()) % 3 == 0:
             self.refresh_house()  # redrawing the map every 3 s is plenty
         return True
 
     def render_house_hud(self):
-        """Floating readout while walking: the chosen signal big, the other one and wall points small."""
+        """Floating readout while walking (when the mini-map is off): the chosen signal big, the other small."""
         rec = self.house_rec
         el = int(rec.elapsed()) if rec else 0
         wifi, dongle = (rec.latest, rec.latest_dongle) if rec else (None, None)
@@ -2133,8 +2300,7 @@ class FrameSettings(Gtk.Window):
             sel, other = wifi, f"Dongle {short(dongle)}"
         else:
             sel, other = dongle, f"Wi-Fi {short(wifi)}"
-        title = (f"{house_map.TARGETS[self.house_target]} · {other} · {el // 60}:{el % 60:02d} · "
-                 + ("Wall ✓" if rec and rec.on_wall() else f"walls {len(rec.walls) if rec else 0}"))
+        title = f"{house_map.TARGETS[self.house_target]} · {other} · {el // 60}:{el % 60:02d}"
         big = f"{sel['dbm']:.0f} dBm" if sel and sel.get("dbm") is not None else "…"
         os.makedirs(os.path.dirname(self.WIFI_HUD), exist_ok=True)
         try:
@@ -2155,49 +2321,53 @@ class FrameSettings(Gtk.Window):
             house_map.save(self.house_m)
             dongle = sum(1 for s in rec.samples if s[house_map.DONGLE] is not None)
             self.house_progress.set_text(
-                f"Added: {rec.distance:.0f} m walked, {len(rec.samples)} readings, {len(rec.walls)} wall points"
+                f"Added: {rec.distance:.0f} m walked, {len(rec.samples)} readings"
                 + ("" if dongle else ", no dongle readings (PC dongle off?)")
                 + ". Walk more to add rooms, then label the map and export the 3D model.")
         else:
             self.house_progress.set_text("No readings: the headset wasn't tracking. Wear it while you walk.")
+        if self.stack.get_visible_child_name() == "House":
+            self.house_watch_start()
         self.draw_house(self.house_m or {})
         self.show_house_result()
 
     def on_house_pref(self, switch, _pspec, key):
         self.house_prefs[key] = switch.get_active()
         house_map.save_prefs(self.house_prefs)
-        rec = self.house_rec
-        if rec and rec.running:
-            if key == "walls":
-                rec.trace_walls = switch.get_active()
-            else:
-                self.set_minimap(switch.get_active())
+        if self.house_rec and self.house_rec.running and key == "minimap":
+            self.set_minimap(switch.get_active())
 
     def set_minimap(self, on):
-        """Shows (renders + starts the overlay) or hides the mini-map in view."""
-        subprocess.run(["systemctl", "--user", "stop", self.MINIMAP_UNIT], capture_output=True)
+        """Shows the mini-map in the middle of your view (it carries the signal readout too), or, with it
+        off, the plain floating readout."""
+        subprocess.run(["systemctl", "--user", "stop", self.MINIMAP_UNIT, self.WIFI_HUD_UNIT], capture_output=True)
         if on:
             self.render_minimap()
-            subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={self.MINIMAP_UNIT}",
-                            kitchen_timer.BIN, "--minimap", self.MINIMAP], capture_output=True)
+            unit, args = self.MINIMAP_UNIT, ["--minimap", self.MINIMAP]
+        else:
+            self.render_house_hud()
+            unit, args = self.WIFI_HUD_UNIT, ["--live", self.WIFI_HUD]
+        subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}", kitchen_timer.BIN, *args],
+                       capture_output=True)
 
     def render_minimap(self):
         rec = self.house_rec
         if not rec:
             return
         pose = rec.pose or rec._last or (0.0, house_map.EYE_HEIGHT, 0.0)
-        sig = rec.latest_dongle if self.house_target == "dongle" else rec.latest
-        name = "Dongle" if self.house_target == "dongle" else "Wi-Fi"
-        caption = (f"{name} {sig['dbm']:.0f} dBm" if sig and sig.get("dbm") is not None else f"{name}: none")
+
+        def short(s):
+            return f"{s['dbm']:.0f}" if s and s.get("dbm") is not None else "--"
+        if self.house_target == "dongle":
+            caption = f"Dongle {short(rec.latest_dongle)} · Wi-Fi {short(rec.latest)}"
+        else:
+            caption = f"Wi-Fi {short(rec.latest)} · Dongle {short(rec.latest_dongle)}"
         if not rec.pose:
             caption = "Not tracking"
         m = house_map.add_walk(self.copy_house(), rec)
         try:
             loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
-            loader.write(house_map.minimap_svg(m, pose, rec.heading, self.house_target, caption,
-                                               hands=dict(rec.hands), on_wall=rec.on_wall(),
-                                               hint=rec.trace_walls and ("trigger" if rec.trigger_ok()
-                                                                         else "arm")).encode())
+            loader.write(house_map.minimap_svg(m, pose, rec.heading, self.house_target, caption).encode())
             loader.close()
             write_rgba(loader.get_pixbuf(), self.MINIMAP)
         except Exception:  # noqa: BLE001
@@ -2209,23 +2379,20 @@ class FrameSettings(Gtk.Window):
         house_map.clear()
         self.house_m = None
         self.house_floor = 0
+        self.house_view.update(zoom=1.0, pan=[0.0, 0.0])
         self.house_progress.set_text("Cleared. Press Start walking to map the house from scratch.")
         self.house_export_lbl.set_text("")
         self.draw_house({})
         self.show_house_result()
 
-    def on_house_click(self, ev_box, event):
+    def on_house_tap(self, event):
         m = self.house_m
         if not m or not self._house_xf or (self.house_rec and self.house_rec.running):
-            return False
-        pix = self.house_img.get_pixbuf()
-        alloc = self.house_img.get_allocation()
-        px = event.x - (alloc.width - pix.get_width()) / 2
-        py = event.y - (alloc.height - pix.get_height()) / 2
-        minx, minz, s, ox, oz = self._house_xf
-        x, z = (px - ox) / s + minx, (py - oz) / s + minz
+            return
+        xf = self._house_xf
+        x, z = self.house_view_metres(xf, *self._map_xy(event))
         labels = m.setdefault("labels", [])
-        near, best = None, 40 / s  # a label within 40 px of the tap
+        near, best = None, 40 / xf["s"]  # a label within 40 px of the tap
         for i, lab in enumerate(labels):
             d = math.hypot(lab["x"] - x, lab["z"] - z)
             if lab.get("floor", 0) == self.house_floor and d <= best:
@@ -2242,12 +2409,12 @@ class FrameSettings(Gtk.Window):
             msg = f"Moved {lab['name']}. Tap another label to move it."
         elif near is None:
             self.label_status.set_text("Tap right on a label's dot.")
-            return True
+            return
         elif mode == "move":
             self._label_sel = near
             self.label_status.set_text(f"Moving {labels[near]['name']}: now tap where it goes.")
             self.draw_house(m)
-            return True
+            return
         elif mode == "rename":
             old = labels[near]["name"]
             labels[near]["name"] = name
@@ -2259,7 +2426,6 @@ class FrameSettings(Gtk.Window):
         house_map.save(m)
         self.draw_house(m)
         self.show_house_result()
-        return True
 
     def on_label_mode(self, mode):
         self._label_sel = None
@@ -2816,11 +2982,8 @@ def snapshot(prefix):
     if win.house_m:  # the mini-map, as it would look in the middle of the house walk
         smp = win.house_m["samples"][len(win.house_m["samples"]) // 2]
         loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
-        wall = (win.house_m.get("walls") or [[smp[0] + 0.6, 1.0, smp[2]]])[-1]
         loader.write(house_map.minimap_svg(win.house_m, (smp[0], smp[1], smp[2]), (0.6, -0.8), "wifi",
-                                           "Wi-Fi -61 dBm", hands={"right": (wall[0], 1.0, wall[2]),
-                                                                   "left": (smp[0] - 0.25, 1.0, smp[2])},
-                                           on_wall={"right": (wall[0], 1.0, wall[2])}).encode())
+                                           "Wi-Fi -61 · Dongle -53").encode())
         loader.close()
         loader.get_pixbuf().savev(f"{prefix}-minimap.png", "png", [], [])
         print(f"wrote {prefix}-minimap.png")

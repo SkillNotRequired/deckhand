@@ -1,18 +1,14 @@
 """Whole-house map for Deckhand: the home's layout plus Wi-Fi and Steam-dongle signal.
 
 Walk the house with the headset on (several walks add up into one map). Twice a second
-a HouseRecorder stores where the headset is (space_tool track, standing space), the
-strength of BOTH links, and wall points:
+a HouseRecorder stores where the headset is (space_tool track, standing space) and the
+strength of BOTH links:
   home Wi-Fi    the Frame's link to your router (iw <station iface> link)
   Steam dongle  the PC dongle's link to the Frame's own 6 GHz access point
                 (iw <ap iface> station dump: how loudly the Frame hears the dongle)
-  walls         the Frame can't detect walls itself (its SteamVR has no plane/scene
-                detection), so hold a controller against the wall as you walk: any
-                controller held out more than WALL_REACH sideways from your head counts
-                as a wall point. The edge of the walked area is the fallback outline.
 
 Heights split floors. Results: a top-down map per floor (0.5 m squares coloured by the
-chosen signal, walls, your path, labels) and a simple 3D model (.glb).
+chosen signal, the edge of where you walked, your path, labels) and a simple 3D model (.glb).
 Tracking can jump if the Frame re-recognises a room; a jump over 2 m starts a new
 path segment instead of drawing a line across the house.
 """
@@ -34,8 +30,6 @@ MAX_SECONDS = 3600
 FLOOR_HEIGHT = 2.7   # metres between storeys (for splitting floors)
 EYE_HEIGHT = 1.6     # head above its floor, roughly
 WALL_HEIGHT = 2.4
-WALL_REACH = 0.40    # without the trigger: arm raised and held this far out from the head ...
-AUTO_HOLD = 5        # ... for this many pose updates (5 a second): about 1 s
 LABELS = ["Router", "PC", "Bedroom", "Kitchen", "Living room", "Office", "Bathroom", "Garage", "Hall"]
 TARGETS = wifi_map.TARGETS
 
@@ -47,66 +41,72 @@ ap_interface = wifi_map.ap_interface
 dongle_signal = wifi_map.dongle_signal
 
 
-class HouseRecorder:
-    def __init__(self):
-        self.samples, self.walls = [], []   # walls: [x, hand y, z, segment, head y, hand]
+class PoseWatcher:
+    """Where the headset is right now (for the "You" marker while the map page is open):
+    space_tool track twice a second as a background SteamVR app; stop() ends it."""
+
+    def __init__(self, every_ms=500):
         self.pose = None                    # latest headset (x, y, z) or None
-        self.heading = (0.0, -1.0)          # latest look direction on the floor (x, z)
-        self.trace_walls = True             # record wall points (see _wall_check)
-        self.hands = {}                     # "left"/"right" -> (x, y, z) when tracked
-        self.buttons = {}                   # "left"/"right" -> (trigger 0..1, pressed-button mask)
-        self.buttons_seen = False           # any button press ever came through (input reaches us)
-        self._k_time = 0.0                  # when SteamVR last gave us controller buttons
+        self.heading = (0.0, -1.0)          # look direction on the floor (x, z)
+        self.every_ms = every_ms
+        self.proc = None
+        self.running = False
+
+    def start(self):
+        if not os.access(wifi_map.SPACE_TOOL, os.X_OK):
+            raise RuntimeError("space_tool is missing: run helpers/build.sh on the Frame")
+        self.proc = subprocess.Popen([wifi_map.SPACE_TOOL, "track", str(self.every_ms)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.running = True
+        threading.Thread(target=self._read_poses, daemon=True).start()
+        return self
+
+    def _read_poses(self):
+        proc = self.proc
+        for line in proc.stdout:
+            p = line.split()
+            if len(p) == 8 and p[0] == "p" and p[1] == "hmd":
+                pos = (float(p[3]), float(p[4]), float(p[5])) if p[2] == "1" else None
+                self.pose = pos
+                fx, fz = float(p[6]), float(p[7])
+                if pos and math.hypot(fx, fz) > 0.2:
+                    self.heading = (fx, fz)
+            if not self.running:
+                break
+
+    def stop(self):
+        self.running = False
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self.proc = None
+        return self
+
+
+class HouseRecorder(PoseWatcher):
+    """A house walk: the headset's position (5 times a second) and both links' signal (twice a second)."""
+
+    def __init__(self):
+        super().__init__(every_ms=200)
+        self.samples = []
         self.latest = None                  # latest home Wi-Fi reading
         self.latest_dongle = None
-        self.running = False
         self.started = 0.0
         self.distance = 0.0
         self.segment = 0
-        self.proc = None
         self.iface = self.ap = None
         self._last = None
-        self._held = {}
-        self._last_wall = {}
 
     def start(self, segment_offset=0):
-        if not os.access(wifi_map.SPACE_TOOL, os.X_OK):
-            raise RuntimeError("space_tool is missing: run helpers/build.sh on the Frame")
         self.iface, self.ap = wifi_map.station_interface(), ap_interface()
         self.segment = segment_offset
-        self.proc = subprocess.Popen([wifi_map.SPACE_TOOL, "track", "200"], stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, text=True)
-        self.running, self.started = True, time.time()
-        threading.Thread(target=self._read_poses, daemon=True).start()
+        super().start()
+        self.started = time.time()
         threading.Thread(target=self._sample, daemon=True).start()
-
-    def _read_poses(self):
-        for line in self.proc.stdout:
-            p = line.split()
-            if len(p) == 8 and p[0] == "p":
-                pos = (float(p[3]), float(p[4]), float(p[5])) if p[2] == "1" else None
-                if p[1] == "hmd":
-                    self.pose = pos
-                    fx, fz = float(p[6]), float(p[7])
-                    if pos and math.hypot(fx, fz) > 0.2:
-                        self.heading = (fx, fz)
-                elif pos:
-                    self.hands[p[1]] = pos
-                    self._wall_check(p[1], pos)
-                else:
-                    self.hands.pop(p[1], None)
-                    self._held[p[1]] = 0
-            elif len(p) == 4 and p[0] == "k":
-                try:
-                    trig, mask = float(p[2]), int(p[3], 16)
-                except ValueError:
-                    continue
-                self.buttons[p[1]] = (trig, mask)
-                self._k_time = time.time()
-                if trig > 0.05 or mask:
-                    self.buttons_seen = True
-            if not self.running:
-                break
+        return self
 
     def _sample(self):
         while self.running:
@@ -130,61 +130,14 @@ class HouseRecorder:
                                      d["dbm"] if d else None, d["tx"] if d else None])
             time.sleep(0.5)
 
-    def trigger_ok(self):
-        """SteamVR is giving us controller buttons right now (not while the dashboard or a game has them)."""
-        return time.time() - self._k_time < 2.0
-
-    def pressed(self, side):
-        """Trigger (or grip) held on that controller."""
-        trig, mask = self.buttons.get(side, (0.0, 0))
-        return trig > 0.5 or bool(mask & ((1 << 33) | (1 << 2)))
-
-    def _wall_check(self, side, hand):
-        """Five times a second per controller: is it marking a wall? Either the trigger/grip is held
-        (instant), or the arm is raised and held out ≥ WALL_REACH from the head for about a second."""
-        pose = self.pose
-        if not (self.running and self.trace_walls and pose):
-            self._held[side] = 0
-            return
-        if self.pressed(side):
-            self._held[side] = max(self._held.get(side, 0), AUTO_HOLD) + 1
-        else:
-            out = (math.hypot(hand[0] - pose[0], hand[2] - pose[2]) > WALL_REACH
-                   and pose[1] - 0.8 < hand[1] < pose[1] + 0.5)
-            self._held[side] = self._held.get(side, 0) + 1 if out else 0
-        if self._held[side] >= AUTO_HOLD:
-            last = self._last_wall.get(side)
-            if last is None or math.hypot(hand[0] - last[0], hand[2] - last[1]) > 0.08:
-                self._last_wall[side] = (hand[0], hand[2])
-                self.walls.append([round(hand[0], 2), round(hand[1], 2), round(hand[2], 2), self.segment,
-                                   round(pose[1], 2), 0 if side == "left" else 1])
-
-    def on_wall(self):
-        """Hands being counted as on a wall right now: {"left"/"right": (x, y, z)}."""
-        if not (self.running and self.trace_walls):
-            return {}
-        return {side: pos for side, pos in list(self.hands.items()) if self._held.get(side, 0) >= AUTO_HOLD}
-
     def elapsed(self):
         return time.time() - self.started if self.started else 0
-
-    def stop(self):
-        self.running = False
-        if self.proc:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-            self.proc = None
-        return self
 
 
 def add_walk(m, rec):
     """Adds a finished walk to the house map `m` (or starts one)."""
-    m = m or {"kind": "house", "samples": [], "walls": [], "labels": [], "distance": 0.0, "walks": 0}
+    m = m or {"kind": "house", "samples": [], "labels": [], "distance": 0.0, "walks": 0}
     m["samples"] += rec.samples
-    m["walls"] = m.get("walls", []) + rec.walls
     m["distance"] = round(m.get("distance", 0) + rec.distance, 1)
     m["walks"] = m.get("walks", 0) + 1
     m["saved"] = time.time()
@@ -253,30 +206,6 @@ def outline_edges(samples, floor):
     return edges
 
 
-def wall_lines(m, floor):
-    """Traced walls on one floor as polylines [[(x, z), ...], ...], one per hand, broken at gaps > 0.6 m."""
-    samples = m.get("samples") or []
-    base = floor_base(samples) if samples else EYE_HEIGHT
-    lines = []
-    for hand in (0, 1):
-        cur, last = [], None
-        for w in m.get("walls", []):
-            if (w[5] if len(w) > 5 else 0) != hand:
-                continue
-            x, z, seg = w[0], w[2], w[3]
-            if floor_of(w[4] if len(w) > 4 else w[1] + 0.6, base) != floor:
-                continue
-            if last and (math.hypot(x - last[0], z - last[1]) > 0.6 or seg != last[2]):
-                if len(cur) > 1:
-                    lines.append(cur)
-                cur = []
-            cur.append((x, z))
-            last = (x, z, seg)
-        if len(cur) > 1:
-            lines.append(cur)
-    return lines
-
-
 def floors(samples):
     base = floor_base(samples)
     return sorted({floor_of(s[1], base) for s in samples})
@@ -325,8 +254,8 @@ PREFS = os.path.expanduser("~/.config/frame-settings/house.json")
 
 
 def prefs():
-    """{'walls': trace walls with a held-out controller, 'minimap': show the mini-map in view}"""
-    p = {"walls": True, "minimap": True}
+    """{'minimap': show the mini-map in view, 'angle': the map's rotation in degrees}"""
+    p = {"minimap": True, "angle": 0}
     try:
         with open(PREFS, encoding="utf-8") as f:
             p.update(json.load(f))
@@ -364,7 +293,6 @@ def load():
             m = json.load(f)
     except (OSError, ValueError, IndexError):
         return None
-    m.setdefault("walls", [])
     m.setdefault("walks", 1)
     return m if m.get("samples") else None
 
@@ -386,8 +314,8 @@ def _srgb_to_linear(hex_colour):
 
 
 def export_glb(m, target="wifi", path=None):
-    """Simple 3D model: dark floor tiles where you walked, walls (traced ones solid, the walked
-    area's outline see-through), a column per 0.5 m square (taller and greener = stronger
+    """Simple 3D model: dark floor tiles where you walked, see-through panels along the edge of the
+    walked area, a column per 0.5 m square (taller and greener = stronger
     signal for `target`), a light trail at head height, labels as tall poles. Y up, metres.
     One material per colour, so any viewer shows the colours (Windows 3D Viewer, Blender…)."""
     samples = m.get("samples", [])
@@ -437,9 +365,6 @@ def export_glb(m, target="wifi", path=None):
             wifi_map.fill(lo + 3))
     for f in floors(samples):
         y0 = f * FLOOR_HEIGHT
-        for line in wall_lines(m, f):
-            for (xa, za), (xb, zb) in zip(line, line[1:]):
-                wall(xa, za, xb, zb, y0, "walls (traced)", "#c9d6e3", 1.0)
         for xa, za, xb, zb in outline_edges(samples, f):
             wall(xa, za, xb, zb, y0, "outline (edge of where you walked)", "#66ccff", 0.25, thick=0.02)
     last = None
@@ -505,14 +430,11 @@ def export_glb(m, target="wifi", path=None):
 
 
 # ------------------------------------------------------------- mini-map ---
-def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.0, hands=None, on_wall=None,
-                hint=False):
+def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.0):
     """Game-style mini-map around the headset, turned so your view direction is up: walked
-    squares coloured by `target` signal (grey = not measured), walls, recent path, labels and
+    squares coloured by `target` signal (grey = not measured), your recent path, labels and
     you as an arrow in the middle. SVG text, size x size px, showing about `radius` metres.
-    hands: {"left"/"right": (x, y, z)} controller dots; on_wall: the hands on a wall right now
-    (their dots turn cyan and the wall being traced glows)."""
-    hands, on_wall = hands or {}, on_wall or {}
+    It sits in the middle of your view, so the background is see-through."""
     samples = m.get("samples") or []
     c = size / 2
     k = (size / 2 - 16) / radius          # px per metre
@@ -531,7 +453,7 @@ def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.
     reach = radius * 1.5
     parts = [f'<defs><clipPath id="r"><rect x="4" y="4" width="{size - 8}" height="{size - 8}" rx="34"/>'
              f'</clipPath></defs>',
-             f'<rect x="4" y="4" width="{size - 8}" height="{size - 8}" rx="34" fill="#0e141b" fill-opacity="0.8"/>',
+             f'<rect x="4" y="4" width="{size - 8}" height="{size - 8}" rx="34" fill="#0e141b" fill-opacity="0.6"/>',
              '<g clip-path="url(#r)">']
     measured = cells(samples, target)
     for f, i, j in footprint(samples):
@@ -543,42 +465,12 @@ def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.
         v = measured.get((f, i, j))
         colour = wifi_map.fill(v[0]) if v else "#2a3440"
         parts.append(f'<polygon points="{pts(((x0, z0), (x0 + CELL, z0), (x0 + CELL, z0 + CELL), (x0, z0 + CELL)))}" '
-                     f'fill="{colour}" fill-opacity="0.85"/>')
-    for xa, za, xb, zb in outline_edges(samples, floor):  # estimated walls: edge of the walked area
-        if min(math.hypot(xa - px, za - pz), math.hypot(xb - px, zb - pz)) < reach:
-            (ax, ay), (bx, by) = P(xa, za), P(xb, zb)
-            parts.append(f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{bx:.1f}" y2="{by:.1f}" stroke="#9fd8ff" '
-                         f'stroke-width="3" stroke-dasharray="8 5"/>')
+                     f'fill="{colour}" fill-opacity="0.8"/>')
     recent = [(s[0], s[2]) for s in samples[-240:] if floor_of(s[1], base) == floor
               and math.hypot(s[0] - px, s[2] - pz) < reach]
     if len(recent) > 1:
         parts.append(f'<polyline points="{pts(recent)}" fill="none" stroke="#ffffff" stroke-opacity="0.45" '
                      f'stroke-width="3" stroke-linejoin="round"/>')
-    for ln in wall_lines(m, floor):
-        near = [p for p in ln if math.hypot(p[0] - px, p[1] - pz) < reach * 1.5]
-        if len(near) > 1:
-            parts.append(f'<polyline points="{pts(near)}" fill="none" stroke="#eef4fa" stroke-width="8" '
-                         f'stroke-linecap="round" stroke-linejoin="round"/>')
-            live = on_wall and any(math.hypot(near[-1][0] - h[0], near[-1][1] - h[2]) < 0.4 for h in on_wall.values())
-            if live:  # the wall being traced right now: glow its newest 2 m
-                tail, run = [near[-1]], 0.0
-                for a in reversed(near[:-1]):
-                    run += math.hypot(a[0] - tail[-1][0], a[1] - tail[-1][1])
-                    tail.append(a)
-                    if run > 2.0:
-                        break
-                parts.append(f'<polyline points="{pts(tail)}" fill="none" stroke="#66ccff" stroke-width="16" '
-                             f'stroke-opacity="0.45" stroke-linecap="round" stroke-linejoin="round"/>'
-                             f'<polyline points="{pts(tail)}" fill="none" stroke="#66ccff" stroke-width="8" '
-                             f'stroke-linecap="round" stroke-linejoin="round"/>')
-    for side, h in hands.items():  # controllers: grey dots, cyan with a ring when on a wall
-        hx, hy = P(h[0], h[2])
-        if side in on_wall:
-            parts.append(f'<circle cx="{hx:.1f}" cy="{hy:.1f}" r="20" fill="none" stroke="#66ccff" stroke-width="4"/>'
-                         f'<circle cx="{hx:.1f}" cy="{hy:.1f}" r="10" fill="#66ccff" stroke="#0e141b" stroke-width="3"/>')
-        else:
-            parts.append(f'<circle cx="{hx:.1f}" cy="{hy:.1f}" r="7" fill="#c9d6e3" fill-opacity="0.8" '
-                         f'stroke="#0e141b" stroke-width="2"/>')
     for lab in m.get("labels", []):
         if lab.get("floor", 0) == floor and math.hypot(lab["x"] - px, lab["z"] - pz) < reach:
             lx, ly = P(lab["x"], lab["z"])
@@ -593,17 +485,8 @@ def minimap_svg(m, pose, heading, target="wifi", caption="", size=420, radius=5.
     parts.append(f'<rect x="4" y="4" width="{size - 8}" height="{size - 8}" rx="34" fill="none" stroke="#66ccff" '
                  f'stroke-opacity="0.8" stroke-width="5"/>')
     if caption:
-        parts.append(f'<text x="{c:.1f}" y="44" fill="#ffffff" font-size="28" font-weight="bold" text-anchor="middle" '
+        parts.append(f'<text x="{c:.1f}" y="44" fill="#ffffff" font-size="26" font-weight="bold" text-anchor="middle" '
                      f'font-family="sans-serif" stroke="#0e141b" stroke-width="6" paint-order="stroke">{caption}</text>')
-    if on_wall:
-        parts.append(f'<rect x="{c - 92:.1f}" y="{size - 70}" width="184" height="44" rx="22" fill="#66ccff"/>'
-                     f'<text x="{c:.1f}" y="{size - 39}" fill="#0e141b" font-size="26" font-weight="bold" '
-                     f'text-anchor="middle" font-family="sans-serif">Wall ✓</text>')
-    elif hint:  # how to draw a wall: "trigger" when SteamVR passes us the trigger, else "arm"
-        text = "Trigger on a wall: draw it" if hint == "trigger" else "Arm out on a wall: draw it"
-        parts.append(f'<rect x="{c - 150:.1f}" y="{size - 66}" width="300" height="38" rx="19" fill="#0e141b" '
-                     f'fill-opacity="0.85"/><text x="{c:.1f}" y="{size - 40}" fill="#c9d6e3" font-size="21" '
-                     f'text-anchor="middle" font-family="sans-serif">{text}</text>')
     parts.append(f'<line x1="{size - 30 - k:.1f}" y1="{size - 28}" x2="{size - 30}" y2="{size - 28}" stroke="#c9d6e3" '
                  f'stroke-width="5"/><text x="{size - 30 - k / 2:.1f}" y="{size - 38}" fill="#c9d6e3" font-size="20" '
                  f'text-anchor="middle" font-family="sans-serif">1 m</text>')

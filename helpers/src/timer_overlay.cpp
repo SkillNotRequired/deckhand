@@ -226,19 +226,18 @@ static int selftest(const char *path) {
 
 // --live <file.rgba>: show <file> in the same top-centre spot and re-upload it whenever it
 // changes, until SIGTERM (Deckhand uses it for the Wi-Fi readout while mapping).
-// --minimap <file.rgba>: the same, as a small panel low on the left (the house walk's mini-map).
+// --minimap <file.rgba>: the same, as a see-through panel in the middle of the view (the house walk's mini-map).
 static int live(const char *path, bool minimap) {
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     Overlay o;
     o.key = "framesettings.live";
     o.up_tan = 0.0875f;  // tan(5 deg): a little above centre, under any timer popup
-    if (minimap) {       // --minimap: lower left of the view, like a game's mini-map
+    if (minimap) {       // --minimap: in the middle of the view (it's see-through)
         o.key = "framesettings.minimap";
-        o.up_tan = -0.29f;
-        o.right = -0.36f;
-        o.width = 0.30f;
-        o.face_eye = true;
+        o.up_tan = 0.0f;
+        o.right = 0.0f;
+        o.width = 0.32f;
     }
     time_t last_mtime = 0;
     long last_ns = -1;

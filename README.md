@@ -15,7 +15,7 @@ doesn't have (yet). Runs from your Steam library, in VR, no desktop mode needed.
 | **Reminders** | A popup in the headset at a set time and date. |
 | **Comfort** | Screenshot blocker (no accidental screenshots), other comfort toggles. |
 | **Rooms** | Save and name play areas, preview them, load one instead of redrawing the boundary. Ceiling indicator for lying down. |
-| **Signal** | Home Wi-Fi *and* Steam dongle signal, live. Play-space map shows the best spot to stand; whole-house map walks your home into a floor plan coloured by signal, with walls you trace, a game-style mini-map in view, and a 3D model export (.glb). |
+| **Signal** | Home Wi-Fi *and* Steam dongle signal, live. Play-space map shows the best spot to stand; whole-house map walks your home into a floor plan coloured by signal that you can drag, rotate and zoom, with a "You" marker, a game-style mini-map in the middle of your view, and a 3D model export (.glb). |
 | **Recline** | Controls for Recline VR (play lying down). |
 | **System** | Headset info, restart SteamVR, **Update app**. |
 
@@ -71,9 +71,8 @@ rooms and maps. From Konsole: `~/Deckhand/uninstall.sh` (or `--keep-data`).
 
 ## Notes
 
-- Walls on the house map come from your controller: hold it out against a wall as you walk along it.
-  Hold the trigger (or grip) while the controller touches the wall; the Frame's cameras
-  don't share wall or depth data with apps. Dashed lines are walls estimated from where you walked.
+- The house map shows where you walked (dashed edge), your path, labels and a yellow "You" arrow. Drag it
+  to move it, and rotate or zoom it with the buttons under it.
 - Signal maps use a colour-blind-safe gradient (dark purple = weak → yellow = strong) with a dBm scale.
 - The dongle's strength is how loudly the Frame hears the PC's dongle (its 6 GHz link); it only shows
   while the PC and Steam are on.
